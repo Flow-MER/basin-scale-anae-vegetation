@@ -1,0 +1,6 @@
+ipykernel
+ipywidgets
+tqdm
+numpy
+pandas
+geopandas

@@ -1,10 +1,15 @@
 ./
 ../
+.venv/
 .backups/
 .git/
 .gitignore
 .prj*
 .vscode/
+spatial/
+csv/*.csv
+output/*.csv
+*.csv
 
 .ipynb_checkpoints/
 
