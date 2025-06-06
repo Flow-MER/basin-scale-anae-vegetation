@@ -7,9 +7,8 @@
 .prj*
 .vscode/
 spatial/
-csv/*.csv
-output/*.csv
 *.csv
+*.zip
 
 .ipynb_checkpoints/
 
