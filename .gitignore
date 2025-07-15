@@ -9,6 +9,7 @@
 spatial/
 *.csv
 *.zip
+!MDB_vegetation_vulnerability*.zip
 
 .ipynb_checkpoints/
 

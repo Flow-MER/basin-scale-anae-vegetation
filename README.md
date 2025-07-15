@@ -25,7 +25,11 @@ This notebook writes the various metric to the working directory in tabular form
 Output files for habitat metrics follow the naming convention: {metric}_{aggregator}_{year_window_width}yr_condition.csv
 e.g.  pv_median_DIWA_5yr_condition.csv  is the median "pv" (green fractional cover) with ANAE polygons aggregated to larger DIWA wetland scales using a 5-year moving window in which to calculate rates of change.  
 
-*NOTE:  The outputs generated from this notebook will vary from the report because this code has removed the MDBA Stand Condition tool inputs and made improvements to the NDVI inputs
+*NOTE:  The outputs generated from this notebook will vary from the previous work in the BWS Vulnerabilities report because:
+
+1. removed the MDBA Stand Condition tool inputs
+2. threshold NDVI inputs to positive values only (limits influence of areas of open water)
+3. removed unvegetated ANAE classes (lakes, clay pans)
 
 ### Mapping the outputs
 
