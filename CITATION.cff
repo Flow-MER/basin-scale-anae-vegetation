@@ -1,12 +1,20 @@
 cff-version: 1.2.0
-title: "MDB Basin-scale ANAE Vegetation Vulnerability"
+title: "MDB Basin-scale ANAE Vegetation Vulnerability. Flow-MER Program"
 message: "If you use this software, please cite it as below."
 authors:
   - family-names: Brooks
     given-names: Shane
     orcid: https://orcid.org/0000-0002-5636-1783
-  - name: "Flow-MER Program"
+  
 version: 2.0
 date-released: 2025-05-01
 license: Creative Commons Attribution 4.0 International (CC-BY-4.0)
-url: "https://github.com/Flow-MER/basin-scale-anae-vegetation"
+repository-code: "https://github.com/Flow-MER/basin-scale-anae-vegetation"
+references:
+  - authors:
+      - name: "Commonwealth of Australia"
+    title: "Assessing Vulnerability for use in Determining Basin-scale Environmental Watering Priorities"
+    type: report
+    year: 2023
+    url: https://www.dcceew.gov.au/water/cewo/publications/assessing-vulnerability-use-determining-basin-scale-environmental-watering-priorities
+
