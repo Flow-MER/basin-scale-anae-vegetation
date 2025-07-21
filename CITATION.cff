@@ -10,7 +10,7 @@ publisher: "Commonwealth Environmental Water Holder"
 version: 2.0
 date-released: 2025-05-01
 license: Creative Commons Attribution 4.0 International (CC-BY-4.0)
-repository-code: "https://github.com/Flow-MER/basin-scale-anae-vegetation"
+repository-code: "https://github.com/brooks-eco/basin-scale-anae-vegetation-vulnerability"
 references:
   - authors:
       - name: "Commonwealth of Australia"
