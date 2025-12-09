@@ -1,6 +1,14 @@
-ipykernel
-ipywidgets
-tqdm
+# Core data processing
 numpy
 pandas
-geopandas
+scikit-learn
+
+
+# Earth Engine
+earthengine-api
+python-dotenv
+
+# Google Drive API (for automated downloads - includes google-auth)
+google-api-python-client
+
+psutil

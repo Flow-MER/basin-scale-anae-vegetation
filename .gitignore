@@ -7,6 +7,8 @@
 .prj*
 .vscode/
 spatial/
+env/
+.env
 *.csv
 *.zip
 !MDB_vegetation_vulnerability*.zip
@@ -18,3 +20,7 @@ data/
 
 *.code-workspace
 .cspell/custom-dictionary-workspace.txt
+landsat_ndvi_output/task_failures.log
+landsat_ndvi_output/watchdog.pid
+.gitignore
+*.pyc
