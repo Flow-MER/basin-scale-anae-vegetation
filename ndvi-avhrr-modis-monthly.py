@@ -1,45 +1,56 @@
 """
-AVHRR/MODIS NDVI Extraction & Harmonization (1986-Present)
+AVHRR/MODIS NDVI Harmonization Pipeline (1986-Present)
 
-Extracts monthly median NDVI from AVHRR (1986-2013) and MODIS (2000-present).
-Performs per-polygon sensor harmonization and outputs annual CSV files.
+Harmonizes AVHRR (1986-2013) and MODIS (2000+) NDVI for 230k ANAE wetland polygons.
+Uses per-polygon Huber regression on 166-month overlap period (Mar 2000-Dec 2013).
 
-WORKFLOW:
-    1. GEE Export: Submit tasks to extract monthly NDVI → Google Drive
-    2. Download: Manually download CSVs from Drive to ./avhrr_modis_output/
-    3. Process: Re-run script to harmonize sensors and generate annual files
+EXECUTION FLOW:
+    1. Check for missing monthly data → Submit GEE export tasks if needed
+    2. Load overlap period data (2000-2013) for both sensors
+    3. Calibrate AVHRR→MODIS using parallel Huber regression (ε=1.35)
+    4. Save calibration parameters immediately (per-polygon + global fallback)
+    5. Process all years in parallel applying harmonization
+    6. Consolidate into compressed annual archive
 
-OUTPUT:
-    NDVI_Harmonized_{year}.csv - Best-available NDVI per month (4 decimals)
-        Columns: UID, yearmonth, NDVI, NDVI_sd, pixel_count, sensor_source
-        sensor_source: MODIS | AVHRR_harmonized | AVHRR_harmonized_global
-    
-    harmonization_quality.csv - Per-polygon AVHRR→MODIS calibration metrics
-    sensor_summary.csv - Data availability by sensor
-    temporal_completeness.csv - Fraction of months with data per polygon
-    anomalous_jumps.csv - Month-to-month NDVI changes >30%
+OUTPUTS:
+    NDVI_Harmonized_Annual.zip - Annual CSV files (39 years)
+    calibration_params.csv - Per-polygon slope/intercept (270k polygons)
+    global_params.csv - Fallback calibration parameters
+    harmonization_quality.csv - R², RMSE, sample counts per polygon
 
-HARMONIZATION:
-    AVHRR → MODIS using per-polygon regression (2000-2013 overlap)
-    Fallback: Global calibration when insufficient overlap data
+SENSOR PRIORITY: MODIS direct (2000+) > AVHRR harmonized (1986-1999)
+PARALLEL PROCESSING: Up to 32 cores for calibration + annual assembly
 
-Author: Shane Brooks (brooks.eco)
-Date: 2025-01-10
+Author: Shane Brooks (brooks.eco) | Date: 2025-01-15
 """
 
-import ee
+# =============================================================================
+# IMPORTS (Execution Order)
+# =============================================================================
+
+# Environment & Logging
+import logging
+import os
+from pathlib import Path
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Parallel Processing
+import multiprocessing as mp
+
+# Data Processing
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import HuberRegressor
-from pathlib import Path
-import logging
-from datetime import datetime
-from dotenv import load_dotenv
-import os
+import zipfile
+from dateutil.relativedelta import relativedelta
+
+# Google Earth Engine
+import ee
 import gee_task_watchdog
 
+# Initialize Environment
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -47,40 +58,44 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # =============================================================================
 
+# Paths & Assets
 DEFAULT_OUT_DIR = "./avhrr_modis_output"
 GEE_ASSET_ID = "projects/ee-litepc/assets/ANAEv3_gt1ha"
 
-# Date range
-START_DATE = (1986, 1)  # AVHRR start
-END_DATE = (2025, 12)  # None = auto-detect latest MODIS
+# Date Ranges
+START_DATE = (2025, 1)  # User configurable start
+END_DATE = (2025, 12)  # User configurable end (set to None for auto-detect)
+AVHRR_END = (2013, 12)
+MODIS_START = (2000, 3)
+OVERLAP_PERIOD = (2000, 3, 2013, 12)  # 166 months for calibration
 
-# Testing
-TEST_POLYGON_LIMIT = None
-USE_RANDOM_SAMPLE = False
+# Processing Parameters
+SCALE_FACTOR = 0.0001  # NDVI scaling
+REDUCE_SCALE = 250  # MODIS native resolution
+MIN_HARMONIZATION_SAMPLES = 24  # Minimum overlap months for per-polygon calibration
+MAX_PROCESSOR_COUNT = int(os.getenv('MAX_PROCESSOR_COUNT', mp.cpu_count()))
 
-# Export
+# GEE Configuration
 USE_CLOUD_STORAGE = False
 GCS_BUCKET = os.getenv('GCS_BUCKET', 'your-bucket')
 GEE_PROJECT = os.getenv('GEE_PROJECT', None)
 
-# Sensor parameters
-AVHRR_END = (2013, 12)
-MODIS_START = (2000, 3)
-OVERLAP_PERIOD = (2000, 3, 2013, 12)
-SCALE_FACTOR = 0.0001
-REDUCE_SCALE = 250  # MODIS resolution
-MIN_HARMONIZATION_SAMPLES = 24  # Need 24 months for calibration
-
+# Sensor Collections
 SENSOR_COLLECTIONS = {
     'AVHRR': 'NOAA/CDR/AVHRR/NDVI/V5',
     'MODIS': 'MODIS/061/MOD13Q1'
 }
 
+# Testing (Production: None)
+TEST_POLYGON_LIMIT = None
+USE_RANDOM_SAMPLE = False
+
 # =============================================================================
-# GEE INITIALIZATION
+# GOOGLE EARTH ENGINE INITIALIZATION
 # =============================================================================
 
 def init_gee():
+    """Initialize Google Earth Engine with appropriate authentication."""
     if USE_CLOUD_STORAGE:
         from google.oauth2 import service_account
         sa_json = os.getenv('GEE_SERVICE_ACCOUNT_JSON')
@@ -97,13 +112,12 @@ def init_gee():
             ee.Initialize(project=GEE_PROJECT)
             logger.info("✓ GEE authenticated")
 
-init_gee()
-
 # =============================================================================
-# UTILITIES
+# UTILITY FUNCTIONS
 # =============================================================================
 
 def list_months(start_year, start_month, end_year, end_month):
+    """Generate list of (year, month) tuples for date range."""
     months, y, m = [], start_year, start_month
     while (y, m) <= (end_year, end_month):
         months.append((y, m))
@@ -111,25 +125,66 @@ def list_months(start_year, start_month, end_year, end_month):
         y += (m == 1)
     return months
 
+def get_processing_date_range():
+    """Determine actual processing date range using auto-detection."""
+    start_year, start_month = START_DATE
+    
+    # Always check latest available MODIS data
+    latest_year, latest_month = get_latest_modis_month()
+    
+    if END_DATE is None:
+        end_year, end_month = latest_year, latest_month
+        logger.info(f"Processing range: {start_year}-{start_month:02d} to {end_year}-{end_month:02d} (auto-detected)")
+    else:
+        user_end_year, user_end_month = END_DATE
+        # Use minimum of user end_date or latest available MODIS
+        if (user_end_year, user_end_month) <= (latest_year, latest_month):
+            end_year, end_month = user_end_year, user_end_month
+            logger.info(f"Processing range: {start_year}-{start_month:02d} to {end_year}-{end_month:02d} (user-specified)")
+        else:
+            end_year, end_month = latest_year, latest_month
+            logger.warning(f"User end date {user_end_year}-{user_end_month:02d} exceeds latest MODIS {latest_year}-{latest_month:02d}")
+            logger.info(f"Processing range: {start_year}-{start_month:02d} to {end_year}-{end_month:02d} (capped to latest MODIS)")
+    
+    return start_year, start_month, end_year, end_month
+
 def get_latest_modis_month():
+    """Auto-detect latest available MODIS data month."""
     now = datetime.now()
+    
+    # Check backwards 1-3 months from current date
     for months_back in range(1, 4):
-        check = now.replace(day=1)
-        for _ in range(months_back):
-            check = (check.replace(day=1) - pd.Timedelta(days=1)).replace(day=1)
-        start = ee.Date.fromYMD(check.year, check.month, 1)
+        check_date = now - relativedelta(months=months_back)
+        start = ee.Date.fromYMD(check_date.year, check_date.month, 1)
         end = start.advance(1, 'month')
-        if ee.ImageCollection('MODIS/061/MOD13Q1').filterDate(start, end).size().getInfo() > 0:
-            logger.info(f"✓ Latest MODIS: {check.year}-{check.month:02d}")
-            return check.year, check.month
-    return now.year, now.month
+        
+        try:
+            size = ee.ImageCollection('MODIS/061/MOD13Q1').filterDate(start, end).size().getInfo()
+            if size > 0:
+                logger.info(f"✓ Latest MODIS: {check_date.year}-{check_date.month:02d} ({size} images)")
+                return check_date.year, check_date.month
+        except Exception as e:
+            logger.warning(f"Failed to check {check_date.year}-{check_date.month:02d}: {e}")
+            continue
+    
+    # Fallback to 3 months ago
+    fallback = now - relativedelta(months=3)
+    logger.warning(f"Using fallback date: {fallback.year}-{fallback.month:02d}")
+    return fallback.year, fallback.month
 
 # =============================================================================
-# GEE EXPORT
+# GOOGLE EARTH ENGINE EXPORT
 # =============================================================================
 
 def export_monthly_ndvi(months_to_export, polygons):
-    """Submit GEE export tasks for monthly NDVI."""
+    """
+    Submit GEE export tasks for monthly NDVI extraction.
+    
+    Applies quality filtering:
+    - AVHRR: Exclude clouds (QA bit 1) and water (QA bit 3)
+    - MODIS: Retain good/marginal quality (SummaryQA bits 0-1 ≤ 1)
+    - Both: Exclude NDVI < 0 (open water)
+    """
     # Murray-Darling Basin AOI
     aoi = ee.Geometry.Polygon([[[138.5,-37.6], [152.5,-37.6], [152.5,-24.5], [138.5,-24.5]]], None, False)
     tasks = []
@@ -139,22 +194,17 @@ def export_monthly_ndvi(months_to_export, polygons):
         start = ee.Date.fromYMD(y, m, 1)
         end = start.advance(1, 'month')
         
-        # Determine which sensors to export
+        # Determine sensor availability
         sensors_to_export = []
-        
-        # AVHRR: 1986-2013
         if y <= AVHRR_END[0] and (y < AVHRR_END[0] or m <= AVHRR_END[1]):
             sensors_to_export.append('AVHRR')
-        
-        # MODIS: 2000-present
         if y >= MODIS_START[0] and (y > MODIS_START[0] or m >= MODIS_START[1]):
             sensors_to_export.append('MODIS')
         
-        # Export each sensor
+        # Export each available sensor
         for sensor_name in sensors_to_export:
             if sensor_name == 'AVHRR':
                 coll = ee.ImageCollection(SENSOR_COLLECTIONS['AVHRR']).filterBounds(aoi).filterDate(start, end)
-                # Bitmask filter: exclude clouds (bit 1) and water (bit 3)
                 def mask_avhrr(img):
                     qa = img.select('QA')
                     cloud_mask = qa.bitwiseAnd(1 << 1).eq(0)  # bit 1 = 0 (not cloudy)
@@ -164,7 +214,6 @@ def export_monthly_ndvi(months_to_export, polygons):
                 monthly_img = coll.select('NDVI').mean().multiply(SCALE_FACTOR).clip(aoi)
             else:  # MODIS
                 coll = ee.ImageCollection(SENSOR_COLLECTIONS['MODIS']).filterBounds(aoi).filterDate(start, end)
-                # Bitmask filter: SummaryQA bits 0-1 <= 1 (good/marginal, exclude snow/cloud)
                 def mask_modis(img):
                     qa = img.select('SummaryQA')
                     return img.updateMask(qa.bitwiseAnd(3).lte(1))  # bits 0-1: 0 or 1
@@ -174,7 +223,7 @@ def export_monthly_ndvi(months_to_export, polygons):
             # Vegetation mask: NDVI >= 0 (exclude water)
             monthly_img = monthly_img.updateMask(monthly_img.gte(0))
             
-            # Zonal statistics
+            # Zonal statistics per polygon
             stats = monthly_img.reduceRegions(
                 collection=polygons,
                 reducer=ee.Reducer.mean().combine(ee.Reducer.stdDev(), '', True).combine(ee.Reducer.count(), '', True),
@@ -183,7 +232,7 @@ def export_monthly_ndvi(months_to_export, polygons):
             ).map(lambda f: f.select(['mean', 'stdDev', 'count', 'UID'], ['NDVI', 'NDVI_sd', 'pixel_count', 'UID']).set('yearmonth', ym)
             ).filter(ee.Filter.notNull(['NDVI']))
             
-            # Export
+            # Submit export task
             desc = f"NDVI_{sensor_name}_{ym}"
             if USE_CLOUD_STORAGE:
                 task = ee.batch.Export.table.toCloudStorage(
@@ -203,230 +252,427 @@ def export_monthly_ndvi(months_to_export, polygons):
     return tasks
 
 # =============================================================================
-# CSV PROCESSING
+# SENSOR HARMONIZATION (Parallel Processing)
 # =============================================================================
 
-def consolidate_monthly_csvs(out_dir):
-    csv_files = list(Path(out_dir).glob("NDVI_*_*.csv"))
-    if not csv_files:
-        logger.warning("No CSV files found")
-        return False
-    
-    monthly_file = Path(out_dir) / "NDVI_monthly_raw.csv"
-    if monthly_file.exists():
-        existing = pd.read_csv(monthly_file)
-        existing_months = set(existing['yearmonth'].unique())
-        logger.info(f"✓ Found existing consolidated file with {len(existing_months)} months")
-    else:
-        existing = None
-        existing_months = set()
-    
-    logger.info(f"✓ Found {len(csv_files)} monthly CSVs")
-    
-    monthly_data = []
-    new_months = 0
-    for csv_file in csv_files:
+def calibrate_uid_slice_merged(merged_slice, process_id):
+    """
+    Optimized UID calibration using pre-merged DataFrame slice.
+    """
+    params, quality = {}, {}
+    uid_groups = merged_slice.groupby('UID', observed=True)
+    total_uids = len(uid_groups)
+
+    for i, (uid, group) in enumerate(uid_groups):
+
+        if len(group) < MIN_HARMONIZATION_SAMPLES:
+            continue
+
+        X, y = group[['NDVI_src']].values, group['NDVI_tgt'].values
+
         try:
-            sensor = csv_file.stem.split('_')[1]
-            df = pd.read_csv(csv_file)
-            if 'yearmonth' not in df.columns or df.empty:
-                continue
+            model = HuberRegressor(epsilon=1.35).fit(X, y)
+            y_pred = model.predict(X)
             
-            month = df['yearmonth'].iloc[0]
-            if month in existing_months:
-                continue
-            
-            df['sensor'] = sensor
-            monthly_data.append(df)
-            new_months += 1
-            logger.info(f"  Loaded: {csv_file.name}")
-        except Exception as e:
-            logger.warning(f"  Error: {csv_file.name} - {e}")
-    
-    if not monthly_data and existing is None:
-        return False
-    
-    if monthly_data:
-        df_new = pd.concat(monthly_data, ignore_index=True)
-        df_new['yearmonth'] = df_new['yearmonth'].astype(int)
-        
-        if existing is not None:
-            df_all = pd.concat([existing, df_new], ignore_index=True)
-        else:
-            df_all = df_new
-        
-        df_all.drop_duplicates(subset=['UID', 'yearmonth', 'sensor'], inplace=True)
-        df_all.to_csv(monthly_file, index=False)
-        logger.info(f"✓ Consolidated {len(df_all)} observations ({new_months} new months)")
-    else:
-        logger.info("✓ No new months to consolidate")
-    
-    return True
+            ss_res = np.sum((y - y_pred)**2)
+            ss_tot = np.sum((y - y.mean())**2)
+            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+            rmse = np.sqrt(ss_res / len(y))
 
-# =============================================================================
-# HARMONIZATION
-# =============================================================================
+            params[uid] = (model.coef_[0], model.intercept_)
+            quality[uid] = {'r2': r2, 'rmse': rmse, 'n': len(group)}
+        except Exception:
+            continue
 
-def harmonize_sensors(out_dir):
-    logger.info("Starting AVHRR→MODIS harmonization...")
+    return params, quality
+
+def calibrate_sensor_pair(df_source, df_target, chunk_size=50000, n_processes=None):
+    """
+    Optimized chunked parallel calibration for memory efficiency.
+    """
+    # Find common UIDs using index intersection (faster than set operations)
+    common_uids = df_source['UID'].cat.categories.intersection(df_target['UID'].cat.categories).tolist()
+    logger.info(f"{len(common_uids)} common UIDs to process in chunks of {chunk_size}")
     
-    monthly_file = Path(out_dir) / "NDVI_monthly_raw.csv"
-    if not monthly_file.exists():
-        logger.warning("No monthly data file")
-        return
+    n_processes = n_processes or min(MAX_PROCESSOR_COUNT, mp.cpu_count())
+    all_params, all_quality, global_sample_data = {}, {}, []
     
-    df_all = pd.read_csv(monthly_file)
-    df_all['yearmonth'] = df_all['yearmonth'].astype(int)
+    # Pre-filter to common UIDs once
+    src_filtered = df_source[df_source['UID'].isin(common_uids)][['UID', 'yearmonth', 'NDVI']]
+    tgt_filtered = df_target[df_target['UID'].isin(common_uids)][['UID', 'yearmonth', 'NDVI']]
     
-    # Setup overlap period
+    # Process in chunks
+    for i in range(0, len(common_uids), chunk_size):
+        chunk_uids = common_uids[i:i+chunk_size]
+        logger.info(f"Chunk {i//chunk_size + 1}/{(len(common_uids)-1)//chunk_size + 1}")
+        
+        # Chunk and merge
+        src_chunk = src_filtered[src_filtered['UID'].isin(chunk_uids)]
+        tgt_chunk = tgt_filtered[tgt_filtered['UID'].isin(chunk_uids)]
+        merged_chunk = pd.merge(src_chunk, tgt_chunk, on=['UID', 'yearmonth'], suffixes=('_src', '_tgt'))
+        
+        if merged_chunk.empty:
+            continue
+        
+        # Sample for global calibration
+        if len(global_sample_data) < 50000:
+            global_sample_data.append(merged_chunk.sample(min(500, len(merged_chunk))))
+        
+        # Split chunk for parallel processing
+        chunk_slices = np.array_split(chunk_uids, n_processes)
+        args_list = [(merged_chunk[merged_chunk['UID'].isin(slice_uids)], j) 
+                    for j, slice_uids in enumerate(chunk_slices) if len(slice_uids) > 0]
+        
+        with mp.Pool(n_processes) as pool:
+            results = pool.starmap(calibrate_uid_slice_merged, args_list)
+        
+        for params, quality in results:
+            all_params.update(params)
+            all_quality.update(quality)
+        
+        # Log chunk completion
+        chunk_pct = ((i//chunk_size + 1) / ((len(common_uids)-1)//chunk_size + 1)) * 100
+        logger.info(f"Chunk {i//chunk_size + 1}/{(len(common_uids)-1)//chunk_size + 1} complete ({chunk_pct:.1f}%)")
+    
+    # Global calibration
+    global_params = (1.0, 0.0)
+    if global_sample_data:
+        sample = pd.concat(global_sample_data, ignore_index=True)
+        model = HuberRegressor(epsilon=1.35).fit(sample[['NDVI_src']], sample['NDVI_tgt'])
+        global_params = (model.coef_[0], model.intercept_)
+        logger.info(f"Global slope={global_params[0]:.4f}, intercept={global_params[1]:.4f}")
+    
+    logger.info(f"Per-polygon: {len(all_params)}/{len(common_uids)} calibrated")
+    return all_params, all_quality, global_params
+
+def build_overlap_calibration(out_dir, processing_years):
+    """
+    Build AVHRR→MODIS calibration from overlap period (Mar 2000 - Dec 2013).
+    
+    Loads 166 months of overlap data, performs parallel calibration,
+    and saves parameters immediately for resume capability.
+    """
+    # Check if any processing years need AVHRR harmonization
+    needs_avhrr = any(year <= AVHRR_END[0] for year in processing_years)
+    if not needs_avhrr:
+        logger.info("✓ No AVHRR data in processing years - skipping calibration")
+        return {}, {}, (1.0, 0.0)
+    
     overlap_start = OVERLAP_PERIOD[0] * 100 + OVERLAP_PERIOD[1]
     overlap_end = OVERLAP_PERIOD[2] * 100 + OVERLAP_PERIOD[3]
-    df_overlap = df_all[(df_all['yearmonth'] >= overlap_start) & (df_all['yearmonth'] <= overlap_end)]
-    uids = df_all['UID'].unique()
     
-    # AVHRR→MODIS calibration
+    # Find overlap period files
+    overlap_files = []
+    for y in range(OVERLAP_PERIOD[0], OVERLAP_PERIOD[2] + 1):
+        for m in range(1, 13):
+            if (y * 100 + m) < overlap_start or (y * 100 + m) > overlap_end:
+                continue
+            overlap_files.extend(Path(out_dir).glob(f"NDVI_*_{y:04d}{m:02d}.zip"))
+            overlap_files.extend(Path(out_dir).glob(f"NDVI_*_{y:04d}{m:02d}.csv"))
+    
+    if not overlap_files:
+        logger.warning("No overlap period files found")
+        return {}, {}, (1.0, 0.0)
+    
+    # Load overlap data with optimized dtypes
+    overlap_data = []
+    uid_categories = None
+    
+    for file_path in overlap_files:
+        try:
+            sensor = file_path.stem.split('_')[1]
+            df = pd.read_csv(file_path, dtype={'UID': 'category', 'yearmonth': 'int32'})
+            if 'yearmonth' in df.columns and not df.empty:
+                df['sensor'] = sensor
+                # Ensure consistent UID categories across files
+                if uid_categories is None:
+                    uid_categories = df['UID'].cat.categories
+                else:
+                    df['UID'] = df['UID'].cat.set_categories(uid_categories, ordered=False)
+                overlap_data.append(df)
+        except Exception as e:
+            logger.warning(f"Error reading {file_path.name}: {e}")
+    
+    if not overlap_data:
+        return {}, {}, (1.0, 0.0)
+    
+    df_overlap = pd.concat(overlap_data, ignore_index=True)
+    # UID already categorical, yearmonth already int32
+    
+    # Verify both sensors present
     has_avhrr = (df_overlap['sensor'] == 'AVHRR').any()
     has_modis = (df_overlap['sensor'] == 'MODIS').any()
     
     if has_avhrr and has_modis:
-        logger.info("Calibrating AVHRR→MODIS...")
+        logger.info("Calibrating AVHRR→MODIS from overlap period...")
+        uids = df_overlap['UID'].unique()
         params, quality, global_params = calibrate_sensor_pair(
             df_overlap[df_overlap['sensor'] == 'AVHRR'],
-            df_overlap[df_overlap['sensor'] == 'MODIS'],
-            uids)
+            df_overlap[df_overlap['sensor'] == 'MODIS'])
+        
+        # Save parameters immediately (resume capability)
+        if params:
+            params_df = pd.DataFrame([(uid, slope, intercept) for uid, (slope, intercept) in params.items()], 
+                                    columns=['UID', 'slope', 'intercept'])
+            params_df.to_csv(Path(out_dir) / "calibration_params.csv", index=False)
+            logger.info(f"✓ Saved {len(params)} per-polygon calibration parameters")
+        
+        global_df = pd.DataFrame([{'slope': global_params[0], 'intercept': global_params[1]}])
+        global_df.to_csv(Path(out_dir) / "global_params.csv", index=False)
+        logger.info(f"✓ Saved global parameters: slope={global_params[0]:.4f}, intercept={global_params[1]:.4f}")
+        
+        return params, quality, global_params
     else:
-        params, quality = {}, {}
-        global_params = (1.0, 0.0)
         logger.info("No overlap data - using identity transform")
+        return {}, {}, (1.0, 0.0)
+
+# =============================================================================
+# ANNUAL DATA PROCESSING (Parallel by Year)
+# =============================================================================
+
+def process_year_data(year, out_dir, params, global_params):
+    """
+    Optimized single year processing with sensor harmonization.
+    """
+    year_files = list(Path(out_dir).glob(f"NDVI_*_{year}*.zip")) + list(Path(out_dir).glob(f"NDVI_*_{year}*.csv"))
+    if not year_files:
+        return None
     
-    # Apply harmonization
-    df_harmonized = []
-    sensor_counts = {'MODIS': 0, 'AVHRR': 0}
+    # Load and concatenate in one step
+    year_data = []
+    for file_path in year_files:
+        try:
+            df = pd.read_csv(file_path, dtype={'UID': 'category', 'yearmonth': 'int32'})
+            if not df.empty and 'yearmonth' in df.columns:
+                df['sensor'] = file_path.stem.split('_')[1]
+                year_data.append(df)
+        except Exception as e:
+            logger.warning(f"Error reading {file_path.name}: {e}")
     
-    for (uid, ym), group in df_all.groupby(['UID', 'yearmonth']):
-        sensors = group['sensor'].values
+    if not year_data:
+        return None
+    
+    df_year = pd.concat(year_data, ignore_index=True)
+    # UID already categorical, yearmonth already int32
+    
+    # Optimized sensor selection and harmonization
+    df_year = df_year.drop_duplicates(['UID', 'yearmonth', 'sensor'])
+    
+    # Split by sensor
+    modis_mask = df_year['sensor'] == 'MODIS'
+    modis_data = df_year[modis_mask].copy()
+    avhrr_data = df_year[~modis_mask].copy()
+    
+    # Filter AVHRR to non-overlapping observations
+    if not modis_data.empty and not avhrr_data.empty:
+        modis_keys = pd.MultiIndex.from_arrays([modis_data['UID'], modis_data['yearmonth']])
+        avhrr_keys = pd.MultiIndex.from_arrays([avhrr_data['UID'], avhrr_data['yearmonth']])
+        avhrr_filtered = avhrr_data[~avhrr_keys.isin(modis_keys)].copy()
+    else:
+        avhrr_filtered = avhrr_data.copy()
+    
+    modis_data['sensor_source'] = 'MODIS'
+    
+    # Vectorized AVHRR harmonization
+    if not avhrr_filtered.empty and params:
+        # Vectorized calibration using map for better performance
+        avhrr_filtered['slope'] = avhrr_filtered['UID'].map(lambda uid: params.get(uid, global_params)[0])
+        avhrr_filtered['intercept'] = avhrr_filtered['UID'].map(lambda uid: params.get(uid, global_params)[1])
         
-        if 'MODIS' in sensors:
-            best = group[group['sensor'] == 'MODIS'].iloc[0].copy()
-            best['sensor_source'] = 'MODIS'
-            sensor_counts['MODIS'] += 1
-        elif 'AVHRR' in sensors:
-            best = group[group['sensor'] == 'AVHRR'].iloc[0].copy()
-            calib = params.get(uid, global_params)
-            best['NDVI'] = best['NDVI'] * calib[0] + calib[1]
-            best['sensor_source'] = 'AVHRR_harmonized' if uid in params else 'AVHRR_harmonized_global'
-            sensor_counts['AVHRR'] += 1
-        else:
+        # Vectorized harmonization
+        avhrr_filtered['NDVI'] = avhrr_filtered['NDVI'] * avhrr_filtered['slope'] + avhrr_filtered['intercept']
+        avhrr_filtered['sensor_source'] = 'AVHRR_harmonized'
+        
+        # Drop temporary columns to save memory
+        avhrr_harmonized = avhrr_filtered.drop(['slope', 'intercept'], axis=1)
+    else:
+        avhrr_harmonized = pd.DataFrame()
+    
+    # Combine results
+    df_harmonized = pd.concat([modis_data, avhrr_harmonized], ignore_index=True)
+    
+    # Calculate sensor counts
+    sensor_counts = {'MODIS': len(modis_data), 'AVHRR': len(avhrr_harmonized)}
+    
+    if not df_harmonized.empty:
+        df_harmonized['NDVI'] = df_harmonized['NDVI'].round(4)
+        df_harmonized['NDVI_sd'] = df_harmonized['NDVI_sd'].round(4)
+        df_harmonized = df_harmonized[['UID', 'yearmonth', 'NDVI', 'NDVI_sd', 'pixel_count', 'sensor_source']]
+        
+        # Save as CSV file
+        csv_path = Path(out_dir) / f"NDVI_Harmonized_{year}.csv"
+        df_harmonized.to_csv(csv_path, index=False)
+        
+        return year, len(df_harmonized), sensor_counts
+    
+    return None
+
+def create_decadal_zips(out_dir, processed_years):
+    """
+    Create decadal zip files from annual CSV files.
+    Groups: 1986-1995, 1996-2005, 2006-2015, 2016-2025
+    """
+    decades = [
+        (1986, 1995), (1996, 2005), (2006, 2015), (2016, 2025)
+    ]
+    
+    for start_year, end_year in decades:
+        decade_years = [y for y in processed_years if start_year <= y <= end_year]
+        if not decade_years:
             continue
+            
+        # Determine actual year range for filename
+        actual_start = min(decade_years)
+        actual_end = max(decade_years)
         
-        df_harmonized.append(best)
+        zip_name = f"NDVI_{actual_start}-{actual_end}_ANAEv3_monthly_AVHRR-MODIS.zip"
+        zip_path = Path(out_dir) / zip_name
+        
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for year in sorted(decade_years):
+                csv_file = Path(out_dir) / f"NDVI_Harmonized_{year}.csv"
+                if csv_file.exists():
+                    zf.write(csv_file, f"NDVI_Harmonized_{year}.csv")
+                    csv_file.unlink()  # Remove CSV after adding to zip
+        
+        logger.info(f"✓ Created {zip_name} with {len(decade_years)} years")
+
+def process_annual_data(out_dir, start_year=None, start_month=None, end_year=None, end_month=None):
+    """
+    Parallel processing of annual harmonized data.
     
-    df_harmonized = pd.DataFrame(df_harmonized)
-    logger.info(f"Selected: MODIS={sensor_counts['MODIS']}, AVHRR={sensor_counts['AVHRR']}")
+    Each year processed independently to eliminate file conflicts.
+    Results consolidated into compressed annual archive.
+    """
+    logger.info("Processing annual data in parallel by year...")
     
-    # Save annual files (rounded to 4 decimals)
-    for year in sorted(df_harmonized['yearmonth'].unique() // 100):
-        df_year = df_harmonized[df_harmonized['yearmonth'] // 100 == year].copy()
-        df_year['NDVI'] = df_year['NDVI'].round(4)
-        df_year['NDVI_sd'] = df_year['NDVI_sd'].round(4)
-        df_year = df_year[['UID', 'yearmonth', 'NDVI', 'NDVI_sd', 'pixel_count', 'sensor_source']]
-        df_year.to_csv(Path(out_dir) / f"NDVI_Harmonized_{year}.csv", index=False)
+    # Find all available years efficiently (exclude ANAEv3 files)
+    all_files = list(Path(out_dir).glob("NDVI_*_*.zip")) + list(Path(out_dir).glob("NDVI_*_*.csv"))
+    all_files = [f for f in all_files if "ANAEv3" not in f.name]
+    years = set()
+    overlap_files_exist = False
     
-    # Save QC outputs
+    # Use passed date range or fallback to config
+    if start_year is None:
+        start_year, start_month = START_DATE
+    if end_year is None:
+        end_year, end_month = END_DATE if END_DATE else (9999, 12)
+    
+    processing_start = start_year * 100 + start_month
+    processing_end = end_year * 100 + end_month
+    
+    for file_path in all_files:
+        try:
+            ym = file_path.stem.split('_')[2]
+            year = int(ym[:4])
+            month = int(ym[4:6])
+            ym_int = year * 100 + month
+            
+            # Only process files within start_date and end_date
+            if not (processing_start <= ym_int <= processing_end):
+                continue
+                
+            years.add(year)
+            
+            # Check if this file is within overlap period
+            overlap_start = OVERLAP_PERIOD[0] * 100 + OVERLAP_PERIOD[1]
+            overlap_end = OVERLAP_PERIOD[2] * 100 + OVERLAP_PERIOD[3]
+            if overlap_start <= ym_int <= overlap_end:
+                overlap_files_exist = True
+        except:
+            continue
+    
+    if not years:
+        logger.warning("No data files found within processing date range")
+        return
+    
+    # Get calibration parameters (only if overlap files exist and AVHRR years need processing)
+    needs_avhrr = any(year <= AVHRR_END[0] for year in years)
+    if needs_avhrr and overlap_files_exist:
+        params, quality, global_params = build_overlap_calibration(out_dir, years)
+    else:
+        params, quality, global_params = {}, {}, (1.0, 0.0)
+        if needs_avhrr:
+            logger.info("✓ No overlap period files found - skipping calibration")
+        else:
+            logger.info("✓ No AVHRR data in processing years - skipping calibration")
+    
+    # Process years in parallel
+    n_processes = min(MAX_PROCESSOR_COUNT, mp.cpu_count(), len(years))
+    logger.info(f"Processing {len(years)} years across {n_processes} processes...")
+    
+    with mp.Pool(n_processes) as pool:
+        args = [(year, out_dir, params, global_params) for year in sorted(years)]
+        results = pool.starmap(process_year_data, args)
+    
+    # Collect results (no consolidation needed)
+    total_sensor_counts = {'MODIS': 0, 'AVHRR': 0}
+    processed_years = []
+    
+    for result in results:
+        if result:
+            year, obs_count, sensor_counts = result
+            total_sensor_counts['MODIS'] += sensor_counts['MODIS']
+            total_sensor_counts['AVHRR'] += sensor_counts['AVHRR']
+            processed_years.append(year)
+            logger.info(f"  ✓ Year {year}: {obs_count} observations → NDVI_Harmonized_{year}.csv")
+    
+    # Create decadal zip files
+    create_decadal_zips(out_dir, processed_years)
+    
+    # Save quality control outputs
     if quality:
         pd.DataFrame(quality).T.to_csv(Path(out_dir) / "harmonization_quality.csv")
     
-    df_harmonized.groupby('sensor_source')['yearmonth'].agg(['min', 'max', 'count']).to_csv(
-        Path(out_dir) / "sensor_summary.csv")
-    
-    all_months = set(df_harmonized['yearmonth'].unique())
-    completeness = df_harmonized.groupby('UID', group_keys=False).apply(
-        lambda x: len(set(x['yearmonth'])) / len(all_months), include_groups=False)
-    completeness.to_csv(Path(out_dir) / "temporal_completeness.csv")
-    
-    df_sorted = df_harmonized.sort_values(['UID', 'yearmonth'])
-    df_sorted['ndvi_diff'] = df_sorted.groupby('UID')['NDVI'].diff()
-    anomalies = df_sorted[df_sorted['ndvi_diff'].abs() > 0.3]
-    anomalies.to_csv(Path(out_dir) / "anomalous_jumps.csv", index=False)
-    
+    # Final summary
+    logger.info(f"✓ Processed {len(processed_years)} years")
+    logger.info(f"✓ Selected: MODIS={total_sensor_counts['MODIS']}, AVHRR={total_sensor_counts['AVHRR']}")
     logger.info(f"✓ Harmonization complete: {len(params)} per-polygon calibrations")
-    logger.info(f"✓ Best-available NDVI: {len(df_harmonized)} observations")
-    logger.info(f"✓ QC: Completeness={completeness.mean():.1%}, Anomalies={len(anomalies)}")
-
-def calibrate_sensor_pair(df_source, df_target, uids):
-    params, quality = {}, {}
-    
-    for uid in uids:
-        merged = pd.merge(
-            df_source[df_source['UID'] == uid][['yearmonth', 'NDVI']],
-            df_target[df_target['UID'] == uid][['yearmonth', 'NDVI']],
-            on='yearmonth', suffixes=('_src', '_tgt'))
-        
-        if len(merged) < MIN_HARMONIZATION_SAMPLES:
-            continue
-        
-        try:
-            X, y = merged['NDVI_src'].values.reshape(-1, 1), merged['NDVI_tgt'].values
-            model = HuberRegressor(epsilon=1.35).fit(X, y)
-            y_pred = model.predict(X)
-            r2 = 1 - np.sum((y - y_pred)**2) / np.sum((y - y.mean())**2)
-            rmse = np.sqrt(np.mean((y - y_pred)**2))
-            
-            params[uid] = (model.coef_[0], model.intercept_)
-            quality[uid] = {'r2': r2, 'rmse': rmse, 'n': len(merged)}
-        except:
-            pass
-    
-    # Global fallback
-    merged_global = pd.merge(
-        df_source[['UID', 'yearmonth', 'NDVI']],
-        df_target[['UID', 'yearmonth', 'NDVI']],
-        on=['UID', 'yearmonth'], suffixes=('_src', '_tgt'))
-    
-    global_params = (1.0, 0.0)
-    if len(merged_global) > 0:
-        X_g, y_g = merged_global['NDVI_src'].values.reshape(-1, 1), merged_global['NDVI_tgt'].values
-        model_g = HuberRegressor(epsilon=1.35).fit(X_g, y_g)
-        global_params = (model_g.coef_[0], model_g.intercept_)
-        logger.info(f"Global AVHRR→MODIS: slope={global_params[0]:.4f}, intercept={global_params[1]:.4f}")
-        logger.info(f"Per-polygon: {len(params)}/{len(uids)} calibrated")
-    
-    return params, quality, global_params
+    logger.info(f"✓ Decadal zip files created")
 
 # =============================================================================
-# MAIN
+# MAIN EXECUTION
 # =============================================================================
 
 def main():
+    """
+    Main execution pipeline:
+    1. Check for missing monthly data
+    2. Submit GEE exports if needed OR process existing data
+    3. Perform harmonization and generate annual outputs
+    """
     out_dir = Path(DEFAULT_OUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    # Determine date range
-    start_year, start_month = START_DATE
-    end_year, end_month = END_DATE if END_DATE else get_latest_modis_month()
+    # Initialize GEE for auto-detection
+    init_gee()
     
-    # Check missing months
+    # Determine target date range (always check latest MODIS)
+    start_year, start_month, end_year, end_month = get_processing_date_range()
+    
+    # Check for missing monthly data
     months = list_months(start_year, start_month, end_year, end_month)
     missing_months = []
     for y, m in months:
         ym = f"{y:04d}{m:02d}"
-        month_csvs = list(out_dir.glob(f"NDVI_*_{ym}.csv"))
-        if not month_csvs:
+        month_files = list(out_dir.glob(f"NDVI_*_{ym}.csv")) + list(out_dir.glob(f"NDVI_*_{ym}.zip"))
+        if not month_files:
             missing_months.append((y, m))
     
     if not missing_months:
-        logger.info("✓ All requested months have CSVs - processing...")
-        if consolidate_monthly_csvs(out_dir):
-            harmonize_sensors(out_dir)
-            logger.info("\n" + "="*60)
-            logger.info("✓ PROCESSING COMPLETE")
-            logger.info(f"Output: {out_dir}")
-            logger.info("="*60)
-            return
+        # All data available - proceed with harmonization
+        logger.info("✓ All requested months have data - processing...")
+        process_annual_data(out_dir, start_year, start_month, end_year, end_month)
+        logger.info("\n" + "="*60)
+        logger.info("✓ PROCESSING COMPLETE")
+        logger.info(f"Output: {out_dir}")
+        logger.info("="*60)
+        return
     
-    # Submit GEE tasks
+    # Missing data - submit GEE export tasks (GEE already initialized)
     logger.info(f"Missing {len(missing_months)} months - submitting GEE export tasks...")
     
+    # Configure polygon collection
     polygons = ee.FeatureCollection(GEE_ASSET_ID)
     if TEST_POLYGON_LIMIT:
         if USE_RANDOM_SAMPLE:
@@ -442,11 +688,14 @@ def main():
     logger.info(f"Date range: {start_year}-{start_month:02d} to {end_year}-{end_month:02d}")
     logger.info(f"Exporting {len(missing_months)} missing months")
     
+    # Launch task monitoring
     if gee_task_watchdog.launch_watchdog():
         logger.info("✓ Task watchdog launched in new window")
     
+    # Submit export tasks
     tasks = export_monthly_ndvi(missing_months, polygons)
     
+    # Instructions for next steps
     logger.info("\n" + "="*60)
     logger.info("NEXT STEPS:")
     logger.info("1. Monitor tasks: https://code.earthengine.google.com/tasks")
