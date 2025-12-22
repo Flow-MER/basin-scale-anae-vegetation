@@ -43,7 +43,6 @@ import pandas as pd
 import numpy as np
 from sklearn.linear_model import HuberRegressor
 import zipfile
-from dateutil.relativedelta import relativedelta
 
 # Google Earth Engine
 import ee
@@ -126,10 +125,8 @@ def list_months(start_year, start_month, end_year, end_month):
     return months
 
 def get_processing_date_range():
-    """Determine actual processing date range using auto-detection."""
+    """Determine actual processing date range using latest MODIS."""
     start_year, start_month = START_DATE
-    
-    # Always check latest available MODIS data
     latest_year, latest_month = get_latest_modis_month()
     
     if END_DATE is None:
@@ -137,7 +134,6 @@ def get_processing_date_range():
         logger.info(f"Processing range: {start_year}-{start_month:02d} to {end_year}-{end_month:02d} (auto-detected)")
     else:
         user_end_year, user_end_month = END_DATE
-        # Use minimum of user end_date or latest available MODIS
         if (user_end_year, user_end_month) <= (latest_year, latest_month):
             end_year, end_month = user_end_year, user_end_month
             logger.info(f"Processing range: {start_year}-{start_month:02d} to {end_year}-{end_month:02d} (user-specified)")
@@ -149,28 +145,17 @@ def get_processing_date_range():
     return start_year, start_month, end_year, end_month
 
 def get_latest_modis_month():
-    """Auto-detect latest available MODIS data month."""
-    now = datetime.now()
-    
-    # Check backwards 1-3 months from current date
-    for months_back in range(1, 4):
-        check_date = now - relativedelta(months=months_back)
-        start = ee.Date.fromYMD(check_date.year, check_date.month, 1)
-        end = start.advance(1, 'month')
+    """Get the date of the last image in the MODIS collection."""
+    try:
+        # Get the latest image date directly
+        latest_image = ee.ImageCollection('MODIS/061/MOD13Q1').limit(1, 'system:time_start', False).first()
+        latest_date_ms = latest_image.get('system:time_start').getInfo()
+        latest_date = datetime.fromtimestamp(latest_date_ms / 1000)
         
-        try:
-            size = ee.ImageCollection('MODIS/061/MOD13Q1').filterDate(start, end).size().getInfo()
-            if size > 0:
-                logger.info(f"✓ Latest MODIS: {check_date.year}-{check_date.month:02d} ({size} images)")
-                return check_date.year, check_date.month
-        except Exception as e:
-            logger.warning(f"Failed to check {check_date.year}-{check_date.month:02d}: {e}")
-            continue
-    
-    # Fallback to 3 months ago
-    fallback = now - relativedelta(months=3)
-    logger.warning(f"Using fallback date: {fallback.year}-{fallback.month:02d}")
-    return fallback.year, fallback.month
+        logger.info(f"✓ Latest MODIS: {latest_date.year}-{latest_date.month:02d}")
+        return latest_date.year, latest_date.month
+    except Exception as e:
+        raise RuntimeError(f"Could not get latest MODIS date: {e}")
 
 # =============================================================================
 # GOOGLE EARTH ENGINE EXPORT

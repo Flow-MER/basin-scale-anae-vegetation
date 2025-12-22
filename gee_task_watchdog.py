@@ -38,13 +38,13 @@ def launch_watchdog():
 
     if sys.platform == 'win32':
         subprocess.Popen(
-            [sys.executable, str(BASE_DIR / 'gee_task_watchdog.py')],
+            [sys.executable, str(BASE_DIR / 'gee_task_watchdog.py'), '--monitor'],
             creationflags=subprocess.CREATE_NEW_CONSOLE,
             cwd=str(BASE_DIR)
         )
     else:
         subprocess.Popen(
-            [sys.executable, str(BASE_DIR / 'gee_task_watchdog.py')],
+            [sys.executable, str(BASE_DIR / 'gee_task_watchdog.py'), '--monitor'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             cwd=str(BASE_DIR)
@@ -129,5 +129,16 @@ def monitor_tasks():
 
 
 if __name__ == '__main__':
+    # Check if this is a direct launch (not already in new window)
+    if '--monitor' not in sys.argv:
+        if is_watchdog_running():
+            print("Watchdog is already running.")
+            sys.exit(0)
+        # Relaunch in new window and exit
+        print("Launching watchdog in new window...")
+        launch_watchdog()
+        sys.exit(0)
+    
+    # This is the monitoring process
     print("Starting GEE task watchdog (CTRL+C to exit)...")
     monitor_tasks()
