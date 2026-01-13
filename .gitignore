@@ -20,6 +20,7 @@ data/
 
 *.code-workspace
 .cspell/custom-dictionary-workspace.txt
+avhrr_modis_output/
 landsat_ndvi_output/task_failures.log
 landsat_ndvi_output/watchdog.pid
 .gitignore
