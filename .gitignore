@@ -7,8 +7,12 @@
 .prj*
 .vscode/
 spatial/
+env/
+.env
 *.csv
 *.zip
+ndvi/
+ndvi_landsat/
 !MDB_vegetation_vulnerability*.zip
 
 .ipynb_checkpoints/
@@ -18,3 +22,7 @@ data/
 
 *.code-workspace
 .cspell/custom-dictionary-workspace.txt
+avhrr_modis_output/
+landsat_ndvi_output/
+.gitignore
+*.pyc
