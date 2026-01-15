@@ -13,6 +13,8 @@ env/
 *.zip
 ndvi/
 ndvi_landsat/
+soil_moisture/
+log/
 !MDB_vegetation_vulnerability*.zip
 
 .ipynb_checkpoints/
