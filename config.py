@@ -57,12 +57,15 @@ class NDVIAvhrrModisConfig(BaseConfig):
 @dataclass(frozen=True)
 class SoilMoistureConfig(BaseConfig):
     OUTPUT_DIR: Path = BaseConfig.OUTPUT_DIR / "soil_moisture"
+    CACHE_DIR: Path = OUTPUT_DIR / "cache"
     ROOT_ZONE_SOIL_MOISTURE_RELATIVE: Path = BaseConfig.INPUT_DIR / "sm_pct.nc"
-    START_DATE="1987-01",
-    END_DATE="1988-01",
-    SM_VAR="sm_pct",
-    crs_fallback="EPSG:4326",
-    CHUNK_SIZE=12,
+    SM_VAR="sm_pct"
+    START_DATE="1986-01-31"
+    END_DATE=None  # None = use last month in netcdf
+    CRS_FALLBACK="EPSG:4326"
+    BATCH_SIZE=12  # Number of months to process in one Dask batch
+    BLOCK_SIZE=1000  # Number of polygons per Dask worker to process together
+
 
 
 ndvi_landsat_cfg = NDVILandsatConfig()
