@@ -11,6 +11,7 @@ env/
 .env
 *.csv
 *.zip
+ndvi/
 !MDB_vegetation_vulnerability*.zip
 
 .ipynb_checkpoints/

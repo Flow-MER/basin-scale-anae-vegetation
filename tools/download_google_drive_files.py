@@ -17,10 +17,12 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 load_dotenv()
-
-FOLDER_NAME = 'GEE_AVHRR_MODIS_NDVI'
-OUTPUT_DIR = './avhrr_modis_output'
+# === Determine script and project directories ===
+SCRIPT_DIR = Path(__file__).resolve().parent  # Tools/
+PROJECT_DIR = SCRIPT_DIR.parent                # Parent folder (where project.py lives)
+OUTPUT_DIR = PROJECT_DIR / 'output/ndvi/avhrr_modis'
 GEE_PROJECT = os.getenv('GEE_PROJECT', None)
+GOOGLE_DRIVE_FOLDER_NAME = 'GEE_AVHRR_MODIS_NDVI'
 
 def authenticate():
     """Authenticate with Google Drive API using GEE credentials."""
@@ -78,7 +80,7 @@ def download_file(service, file_id, file_name, output_path):
     with open(output_path, 'wb') as f:
         f.write(fh.getvalue())
 
-def download_all_files(folder_name=FOLDER_NAME, output_dir=OUTPUT_DIR):
+def download_all_files(folder_name=GOOGLE_DRIVE_FOLDER_NAME, output_dir=OUTPUT_DIR):
     """Download all files from Drive folder."""
     # Create output directory
     Path(output_dir).mkdir(parents=True, exist_ok=True)

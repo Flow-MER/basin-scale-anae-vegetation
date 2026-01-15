@@ -1,6 +1,8 @@
 """
-GEE Task Monitor - Watches running tasks and logs failures
-Auto-launched by main NDVI script or run standalone.
+GEE Task Watchdog
+- Monitors running NDVI tasks in Google Earth Engine
+- Logs failures and completions to data/gee_tasks/task_failures.log
+- Can be launched directly or from a parent script
 """
 
 import ee
@@ -13,15 +15,21 @@ from datetime import datetime
 import psutil
 import traceback
 
-# Absolute paths
-BASE_DIR = Path(__file__).parent.resolve()
-LOG_FILE = BASE_DIR / 'task_failures.log'
-PID_FILE = BASE_DIR / 'watchdog.pid'
 CHECK_INTERVAL = 60  # seconds
 
+# === Determine script and project directories ===
+SCRIPT_DIR = Path(__file__).resolve().parent  # Tools/
+PROJECT_DIR = SCRIPT_DIR.parent                # Parent folder (where project.py lives)
+DATA_DIR = SCRIPT_DIR / 'data' / 'gee_tasks'
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+LOG_FILE = DATA_DIR / 'task_failures.log'
+PID_FILE = DATA_DIR / 'watchdog.pid'
+
+
+# === Watchdog helpers ===
 def is_watchdog_running():
-    """Check if watchdog is already running."""
+    """Check if watchdog is already running using PID file."""
     if not PID_FILE.exists():
         return False
     try:
@@ -32,36 +40,43 @@ def is_watchdog_running():
 
 
 def launch_watchdog():
-    """Launch watchdog in new console window."""
+    """
+    Launch this script in a new console window.
+    Safe to call from project.py or from the Tools folder directly.
+    """
     if is_watchdog_running():
+        print("Watchdog already running.")
         return False
+
+    WATCHDOG_SCRIPT = Path(__file__).resolve()
 
     if sys.platform == 'win32':
         subprocess.Popen(
-            [sys.executable, str(BASE_DIR / 'gee_task_watchdog.py'), '--monitor'],
+            [sys.executable, str(WATCHDOG_SCRIPT), '--monitor'],
             creationflags=subprocess.CREATE_NEW_CONSOLE,
-            cwd=str(BASE_DIR)
+            cwd=str(WATCHDOG_SCRIPT.parent)
         )
     else:
         subprocess.Popen(
-            [sys.executable, str(BASE_DIR / 'gee_task_watchdog.py'), '--monitor'],
+            [sys.executable, str(WATCHDOG_SCRIPT), '--monitor'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            cwd=str(BASE_DIR)
+            cwd=str(WATCHDOG_SCRIPT.parent)
         )
 
     time.sleep(2)
+    print("Watchdog launched in new window.")
     return True
 
 
+# === Monitoring function ===
 def monitor_tasks():
-    """Monitor GEE tasks and log failures."""
+    """Monitor GEE NDVI tasks and log failures/completions."""
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    # Write PID file
     PID_FILE.write_text(str(os.getpid()))
 
     try:
+        # Initialize GEE
         try:
             ee.Initialize(project='ee-litepc')
         except Exception as e:
@@ -69,34 +84,34 @@ def monitor_tasks():
             print(err_text)
             with open(LOG_FILE, 'a') as f:
                 f.write(f"{datetime.now().isoformat()},ERROR,GEE_INIT,{err_text}\n")
-            return  # Cannot continue without EE
+            return
 
-        # Load previously seen tasks from log
+        # Load previously seen tasks
         seen_tasks = set()
         if LOG_FILE.exists():
             with open(LOG_FILE, 'r') as f:
                 for line in f:
                     parts = line.strip().split(',')
                     if len(parts) >= 4:
-                        task_id = parts[3]  # task_id is 4th column
-                        seen_tasks.add(task_id)
+                        seen_tasks.add(parts[3])
             print(f"Loaded {len(seen_tasks)} previously seen tasks from log")
-        
-        print(f"Watchdog started (PID: {os.getpid()})")
-        
-        # Show currently running tasks on startup
+
+        print(f"Watchdog started (PID {os.getpid()})")
+
+        # Show currently running NDVI tasks
         try:
             tasks = ee.data.getTaskList()
-            running_tasks = [t for t in tasks if t.get('state') == 'RUNNING' and t.get('description', '').startswith('NDVI_')]
+            running_tasks = [t for t in tasks if t.get('state') == 'RUNNING' and t.get('description','').startswith('NDVI_')]
             if running_tasks:
                 print(f"Currently running tasks ({len(running_tasks)}):")
-                for task in running_tasks:
-                    print(f"  ▶ {task.get('description', 'Unknown')}")
+                for t in running_tasks:
+                    print(f"  ▶ {t.get('description', 'Unknown')}")
             else:
                 print("No NDVI tasks currently running")
         except Exception as e:
             print(f"Could not fetch initial task status: {e}")
 
+        # Main loop
         while True:
             try:
                 tasks = ee.data.getTaskList()
@@ -114,22 +129,21 @@ def monitor_tasks():
                     continue
 
                 state = task.get('state')
-                desc = task.get('description', 'Unknown')
-
+                desc = task.get('description','Unknown')
                 if not desc.startswith('NDVI_'):
                     continue
 
-                if state in ['FAILED', 'CANCELLED']:
-                    error = task.get('error_message', 'No error message')
-                    timestamp = datetime.now().isoformat()
-                    with open(LOG_FILE, 'a') as f:
+                timestamp = datetime.now().isoformat()
+
+                if state in ['FAILED','CANCELLED']:
+                    error = task.get('error_message','No error message')
+                    with open(LOG_FILE,'a') as f:
                         f.write(f"{timestamp},{desc},{state},{task_id},{error}\n")
                     print(f"✗ {desc}: {state} - {error}")
                     seen_tasks.add(task_id)
 
                 elif state == 'COMPLETED':
-                    timestamp = datetime.now().isoformat()
-                    with open(LOG_FILE, 'a') as f:
+                    with open(LOG_FILE,'a') as f:
                         f.write(f"{timestamp},{desc},{state},{task_id},\n")
                     print(f"✓ {desc}: COMPLETED")
                     seen_tasks.add(task_id)
@@ -141,17 +155,13 @@ def monitor_tasks():
             PID_FILE.unlink()
 
 
+# === Entry point ===
 if __name__ == '__main__':
-    # Check if this is a direct launch (not already in new window)
+    # Auto-launch in new console if not monitoring
     if '--monitor' not in sys.argv:
-        if is_watchdog_running():
-            print("Watchdog is already running.")
-            sys.exit(0)
-        # Relaunch in new window and exit
-        print("Launching watchdog in new window...")
         launch_watchdog()
         sys.exit(0)
-    
-    # This is the monitoring process
-    print("Starting GEE task watchdog (CTRL+C to exit)...")
+
+    # Otherwise, run the monitoring loop
+    print("Starting GEE Task Watchdog (CTRL+C to exit)...")
     monitor_tasks()
