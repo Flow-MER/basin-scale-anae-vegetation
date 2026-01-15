@@ -1,4 +1,5 @@
 import os
+import logging
 import pandas as pd
 import geopandas as gpd
 import xarray as xr
@@ -6,18 +7,15 @@ import xarray as xr
 from exactextract import exact_extract
 from tqdm import tqdm
 import zipfile
+from tools.logging_setup import setup_logging
+from pathlib import Path
+from config import soil_moisture_cfg as config
 
-def process_soil_moisture_exact(
-    start_date,
-    end_date,
-    zones_path,
-    nc_path,
-    var="sm_pct",
-    uid_field="UID",
-    out_path="./output/",
-    crs_fallback="EPSG:4326",
-    chunk_size=12,
-):
+# Initialize Environment
+logger = logging.getLogger(__name__)
+
+
+def process_soil_moisture_exact():
     """
     Compute monthly zonal statistics from a NetCDF raster time series.
     
@@ -26,20 +24,21 @@ def process_soil_moisture_exact(
     - Memory-efficient data handling
     - Vectorized date operations
     """
-    os.makedirs(out_path, exist_ok=True)
+    crs_fallback="EPSG:4326"
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     
     # Load and validate zones
-    zones = gpd.read_file(zones_path)
+    zones = gpd.read_file(config.POLYGON_PATH)
     if zones.crs is None:
         raise ValueError("Zones file must have a defined CRS")
 
     # Open dataset with chunking for memory efficiency
-    with xr.open_dataset(nc_path, chunks={'time': chunk_size}) as ds:
-        ds = ds.sel(time=slice(start_date, end_date))
+    with xr.open_dataset(config.ROOT_ZONE_SOIL_MOISTURE_RELATIVE, chunks={'time': config.CHUNK_SIZE}) as ds:
+        ds = ds.sel(time=slice(config.START_DATE, config.END_DATE))
         
-        if var not in ds:
-            raise ValueError(f"Variable '{var}' not found in dataset.")
-        da = ds[var]
+        if config.SM_VAR not in ds:
+            raise ValueError(f"Variable '{config.SM_VAR}' not found in dataset.")
+        da = ds[config.SM_VAR]
 
         # Optimize dimension handling
         dim_mapping = {}
@@ -59,44 +58,35 @@ def process_soil_moisture_exact(
         da = da.rio.clip_box(*zones.total_bounds)
 
         # Process in chunks and collect results
-        output_file = os.path.join(out_path, f"soil_moisture_zonal_{start_date}_{end_date}.csv")
+        output_file = config.OUTPUT_DIR / f"soil_moisture_zonal_{config.START_DATE}_{config.END_DATE}.csv"
         results = []
         
         for i in tqdm(range(len(da.time)), desc="Processing time slices"):
             slice_da = da.isel(time=i)
-            stats = exact_extract(slice_da, zones, "mean", include_cols=[uid_field], output="pandas")
+            stats = exact_extract(slice_da, zones, "mean", include_cols=[config.POLY_UID], output="pandas")
             stats["date"] = pd.to_datetime(da.time.values[i]).replace(day=1)
             results.append(stats)
             
             # Write in chunks to manage memory
-            if len(results) >= chunk_size or i == len(da.time) - 1:
+            if len(results) >= config.CHUNK_SIZE or i == len(da.time) - 1:
                 chunk_df = pd.concat(results, ignore_index=True)
-                chunk_df.to_csv(output_file, mode="a", header=(i < chunk_size), index=False)
+                chunk_df.to_csv(output_file, mode="a", header=(i < config.CHUNK_SIZE), index=False)
                 results = []
 
     return output_file
 
+def main():
+    setup_logging(config.LOG_DIR, Path(__file__).name)
 
-if __name__ == "__main__":
-    zones_file = r"D:\BWSVulnerability\WIT\ANAEv3_WIT_clean16052025\ANAEv3_WIT.shp"
-    nc_file = r"D:\BWSVulnerability\climate\sm_pct_relative_monthly.nc"
-
-    csv_path = process_soil_moisture_exact(
-        start_date="1987-01",
-        end_date="1988-01",
-        zones_path=zones_file,
-        nc_path=nc_file,
-        var="sm_pct",
-        uid_field="UID",
-        out_path="./output/",
-        crs_fallback="EPSG:4326",
-        chunk_size=12,
-    )
+    csv_path = process_soil_moisture_exact()
 
     print(f"Output saved to: {csv_path}")
     
     # Compress output
-    zip_file = csv_path + ".zip"
+    zip_file = Path(str(csv_path) + ".zip")
     with zipfile.ZipFile(zip_file, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        zf.write(csv_path, os.path.basename(csv_path))
+        zf.write(csv_path, str(csv_path))
     print(f"Compressed to: {zip_file}")
+
+if __name__ == "__main__":
+    main()
