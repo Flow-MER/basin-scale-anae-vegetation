@@ -9,6 +9,7 @@ from tqdm import tqdm
 from multiprocessing import Pool
 from functools import partial
 import xarray as xr
+from config import soil_moisture_cfg as config
 
 arcpy.env.overwriteOutput = True
 
@@ -52,9 +53,9 @@ def process_year(year, start_date, end_date, zonefile):
     with arcpy.EnvManager(outputCoordinateSystem=spatialRef, extent=extent, cellSize=zonefile):
         # Subset multidimensional raster
         arcpy.md.SubsetMultidimensionalRaster(
-            in_multidimensional_raster=r"D:\BWSVulnerability\climate\sm_pct_relative_monthly.nc",
+            in_multidimensional_raster=config.ROOT_ZONE_SOIL_MOISTURE_RELATIVE,
             out_multidimensional_raster=crf_path,
-            variables="sm_pct",
+            variables=config.SM_VAR,
             dimension_def="BY_RANGES",
             dimension_ranges=f"StdTime {start_date} {end_date}"
         )
@@ -62,7 +63,7 @@ def process_year(year, start_date, end_date, zonefile):
         # Zonal statistics
         arcpy.ia.ZonalStatisticsAsTable(
             in_zone_data=zonefile,
-            zone_field="UID",
+            zone_field=config.POLY_UID,
             in_value_raster=crf_path,
             out_table=result_table,
             ignore_nodata="DATA",
@@ -96,12 +97,13 @@ if __name__ == "__main__":
     extent = f'138.5 -37.7 152.5 -24.5 {crs}'
     out_soil_moisture_monthly_zip = r"D:\FlowMER2.0\basin-scale-anae-vegetation-vulnerability\input\csv\ANAE_soilmoistureanomally_monthly.csv.zip"
     
+    
     # Create zone raster once
     if not arcpy.Exists(zonefile):
         with arcpy.EnvManager(outputCoordinateSystem=crs, extent=extent, cellSize=cellSize):
             arcpy.conversion.PolygonToRaster(
-                in_features=r"ANAEv3_WIT.shp",  
-                value_field="UID",
+                in_features=config.POLYGON_PATH,  
+                value_field=config.POLY_UID,
                 out_rasterdataset=zonefile,
                 cell_assignment="CELL_CENTER",
                 cellsize=cellSize,

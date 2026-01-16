@@ -44,12 +44,12 @@ from pystac_client import Client
 import psutil
 import time
 from tqdm import tqdm
-import dask
-from dask.distributed import get_client
-from config import ndvi_landsat_cfg as config
+from dask import delayed, compute as dask_compute
+from dask.distributed import Future, get_client
 from tools.logging_setup import setup_logging
 from tools.dask import start_dask
 
+from config import ndvi_landsat_cfg as config
 logger = logging.getLogger(__name__)
 
 
@@ -406,7 +406,7 @@ def zonal_mean(ndvi, clear_mask, tiles, int_to_uid):
 # MACRO-REGION PROCESSING
 # =========================
 
-
+@delayed
 def process_tile_from_macro(tile, ndvi_med, clear_mask_med, tile_masks):
     """Worker-level processing: loads mapping from local cache."""
     # Retrieve the mapping from the local process memory
@@ -425,7 +425,6 @@ def process_tile_from_macro(tile, ndvi_med, clear_mask_med, tile_masks):
         return pd.read_parquet(cache_file)
 
     # Resolve Future if needed (when called via dask.delayed)
-    from dask.distributed import Future
     if isinstance(tile_masks, Future):
         tile_masks = tile_masks.result()
     
@@ -613,13 +612,13 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
 
     tile_tasks = []
     for tile in uncached_tiles:
-        task = dask.delayed(process_tile_from_macro)(
+        task = process_tile_from_macro(
             tile, ndvi_med, clear_mask_med, tile_masks_future,
         )
         tile_tasks.append(task)
 
     logger.info(f"   Macro-tile {macro_id}: parallel compute for {len(tile_tasks)} sub-tiles")
-    new_results = dask.compute(*tile_tasks)
+    new_results = dask_compute(*tile_tasks)
 
     del ndvi_med, clear_mask_med
     return cached_tiles + [r for r in new_results if r is not None]
@@ -793,7 +792,7 @@ def main():
                     break
                 process_month(year, month, raster_tiles, macro_tiles, dask_client, catalog)
     finally:
-        client.close()
+        dask_client.close()
 
 
 if __name__ == "__main__":

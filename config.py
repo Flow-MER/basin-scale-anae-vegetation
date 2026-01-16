@@ -11,7 +11,7 @@ class BaseConfig:
     OUTPUT_DIR: Path = BASE_DIR / "output"
     LOG_DIR: Path = BASE_DIR / "log"
     TOOLS_DIR: Path = BASE_DIR / "tools"
-    POLYGON_PATH: Path = INPUT_DIR / "ANAEv3_BWS.shp"
+    POLYGON_PATH: Path = INPUT_DIR / "ANAEv3_WIT.shp"
     POLY_UID: str = "UID"
 
 @dataclass(frozen=True)
