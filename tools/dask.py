@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 # DASK SETUP
 # =========================
 
-def start_dask(n_workers=None):
+def start_dask(workers=None):
     """Start a Dask local cluster with optimized settings."""   
     
     total_memory_gb = psutil.virtual_memory().total / (1024**3)
@@ -20,7 +20,7 @@ def start_dask(n_workers=None):
     # We leave 20% or 4GB (whichever is larger) for the OS to prevent freezing
     usable_ram = max(total_memory_gb * 0.8, total_memory_gb - 4)
     # Small number of workers for STAC loading efficiency
-    n_workers = n_workers or max(1, n_cores // 8)
+    n_workers = workers or max(1, n_cores // 8)
     threads_per_worker = max(4, n_cores // n_workers)
     memory_limit_per_worker = int(usable_ram // n_workers)
 
@@ -31,7 +31,6 @@ def start_dask(n_workers=None):
         memory_limit=f"{memory_limit_per_worker}GB",
         dashboard_address=f":{config.DASK_DASHBOARD_PORT}",
         silence_logs=logging.ERROR,
-        worker_options={"profile": False},
         env={
             # Public cloud buckets (DEA, AWS Open Data, etc.)
             "AWS_NO_SIGN_REQUEST": "YES",
