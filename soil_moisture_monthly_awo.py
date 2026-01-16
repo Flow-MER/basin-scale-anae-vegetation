@@ -141,7 +141,7 @@ def compute_zonal_statistics(polygon_shapefile, unique_id, cache_dir, output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     return_value = False
     
-    logger.info("Opening NetCDF...")
+    logger.info("Opening Soil Moisture NetCDF...")
     try:
         ds = xr.open_dataset(netcdf_file, chunks={"time": 1})
     except FileNotFoundError:
@@ -153,6 +153,7 @@ def compute_zonal_statistics(polygon_shapefile, unique_id, cache_dir, output_dir
     
     # Determine end_date from netcdf if not specified
     all_times = pd.to_datetime(ds.time.values)
+    logger.info(f"Soil Moisture NetCDF time range: {all_times[0].strftime('%Y-%m-%d')} to {all_times[-1].strftime('%Y-%m-%d')}")
     start_date = pd.to_datetime(config.START_DATE)
     end_date = pd.to_datetime(config.END_DATE) if config.END_DATE else all_times[-1]
     
@@ -166,7 +167,7 @@ def compute_zonal_statistics(polygon_shapefile, unique_id, cache_dir, output_dir
                 if (pd.Timestamp(t).year, pd.Timestamp(t).month) not in existing_months]
     
     if not job_list:
-        logger.info("No new months to process. All data cached.")
+        logger.info(f"No new months to process. All data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} are cached.")
         return return_value
     
     logger.info(f"Processing {len(job_list)} months: {job_list[0][:2]} to {job_list[-1][:2]}")
