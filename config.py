@@ -27,6 +27,8 @@ class NDVILandsatConfig(BaseConfig):
     TILE_PIXELS: int = 2048
     MACRO_TILE_FACTOR: int = 4
     START_YEAR: int = 2025
+    START_DATE: tuple = (1988, 1)
+    END_DATE: tuple | None = None
     WOFS_FILTER_MASK: int = 0b01100011
     DASK_DASHBOARD_PORT: int = 8787
     MAX_DASK_TASKS: int = 50000
@@ -36,8 +38,8 @@ class NDVILandsatConfig(BaseConfig):
 class NDVIAvhrrModisConfig(BaseConfig):
     OUTPUT_DIR: Path = BaseConfig.OUTPUT_DIR / "ndvi/avhrr_modis"
     GEE_ASSET_ID: str = "projects/ee-litepc/assets/ANAEv3_gt1ha"
-    START_DATE: tuple = (2026, 1)
-    END_DATE: tuple = None
+    START_DATE: tuple = (1986, 1)
+    END_DATE: tuple | None = None
     AVHRR_END: tuple = (2013, 12)
     MODIS_START: tuple = (2000, 3)
     OVERLAP_PERIOD: tuple = (2000, 3, 2013, 12)
@@ -59,12 +61,12 @@ class SoilMoistureConfig(BaseConfig):
     OUTPUT_DIR: Path = BaseConfig.OUTPUT_DIR / "soil_moisture"
     CACHE_DIR: Path = OUTPUT_DIR / "cache"
     ROOT_ZONE_SOIL_MOISTURE_RELATIVE: Path = BaseConfig.INPUT_DIR / "sm_pct.nc"
-    SM_VAR="sm_pct"
-    START_DATE="1986-01-31"
-    END_DATE=None  # None = use last month in netcdf
-    CRS_FALLBACK="EPSG:4326"
-    BATCH_SIZE=12  # Number of months to process in one Dask batch
-    BLOCK_SIZE=1000  # Number of polygons per Dask worker to process together
+    SM_VAR: str = "sm_pct"
+    START_DATE: str = "1986-01-31"
+    END_DATE: str | None = None  # None = use last month in netcdf
+    CRS_FALLBACK: str = "EPSG:4326"
+    BATCH_SIZE: int = 12  # Number of months to process in one Dask batch
+    BLOCK_SIZE: int = 1000  # Number of polygons per Dask worker to process together
 
 
 

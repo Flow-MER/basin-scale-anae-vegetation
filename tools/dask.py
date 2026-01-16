@@ -46,6 +46,15 @@ def start_dask(workers=None):
             # Small in-process read cache (per worker)
             "VSI_CACHE": "TRUE",
             "VSI_CACHE_SIZE": "10485760",  # 10 MB
+            
+            # Enable HTTP/2 for faster concurrent header requests
+            "GDAL_HTTP_VERSION": "2",
+
+            # Important: Keep connections open between internal rasterio/gdal calls
+            "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
+
+            # Use persistent connections across your workers
+            "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff,.vrt",
         },
     )
 
