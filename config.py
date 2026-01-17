@@ -64,9 +64,10 @@ class SoilMoistureConfig(BaseConfig):
     SM_VAR: str = "sm_pct"
     START_DATE: str = "1986-01-31"
     END_DATE: str | None = None  # None = use last month in netcdf
-    CRS_FALLBACK: str = "EPSG:4326"
+    CRS_FALLBACK: str = "EPSG:4326" #WGS_84 matches netcdf
+    DASK_N_WORKERS_OVERRIDE: int = 16 # Number of Dask workers to use
     BATCH_SIZE: int = 12  # Number of months to process in one Dask batch
-    BLOCK_SIZE: int = 1000  # Number of polygons per Dask worker to process together
+    BLOCK_SIZE: int = 5000  # Number of polygons per Dask worker to process together
 
 
 
