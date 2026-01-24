@@ -128,6 +128,16 @@ def get_latest_modis_month():
 # =============================================================================
 
 def export_monthly_ndvi(months_to_export, polygons):
+    """
+    Submits Google Earth Engine export tasks for missing monthly NDVI data.
+
+    Args:
+        months_to_export (list): List of (year, month) tuples to process.
+        polygons (ee.FeatureCollection): The polygons to reduce regions over.
+
+    Returns:
+        list: List of started ee.batch.Task objects.
+    """
     aoi = ee.Geometry.Polygon([[[138.5,-37.6], [152.5,-37.6], [152.5,-24.5], [138.5,-24.5]]], None, False)
     tasks = []
     
@@ -193,6 +203,7 @@ def export_monthly_ndvi(months_to_export, polygons):
 # =============================================================================
 
 def calibrate_uid_slice_merged(merged_slice, process_id):
+    """Calibrates AVHRR to MODIS for a slice of UIDs using Huber Regression."""
     params, quality = {}, {}
     uid_groups = merged_slice.groupby('UID', observed=True)
 
@@ -219,6 +230,18 @@ def calibrate_uid_slice_merged(merged_slice, process_id):
     return params, quality
 
 def calibrate_sensor_pair(df_source, df_target, chunk_size=50000, n_processes=None):
+    """
+    Performs parallel calibration between source (AVHRR) and target (MODIS) sensors.
+
+    Args:
+        df_source (pd.DataFrame): Source sensor data.
+        df_target (pd.DataFrame): Target sensor data.
+        chunk_size (int): Number of UIDs to process per chunk.
+        n_processes (int): Number of parallel processes.
+
+    Returns:
+        tuple: (per_polygon_params, quality_metrics, global_params)
+    """
     common_uids = df_source['UID'].cat.categories.intersection(df_target['UID'].cat.categories).tolist()
     logger.info(f"{len(common_uids)} common UIDs to process in chunks of {chunk_size}")
     
@@ -274,6 +297,7 @@ def calibrate_sensor_pair(df_source, df_target, chunk_size=50000, n_processes=No
     return all_params, all_quality, global_params
 
 def build_overlap_calibration(processing_years):
+    """Builds calibration parameters using the overlap period (2000-2013)."""
     needs_avhrr = any(year <= config.AVHRR_END[0] for year in processing_years)
     if not needs_avhrr:
         logger.info("✓ No AVHRR data in processing years - skipping calibration")
@@ -346,6 +370,7 @@ def build_overlap_calibration(processing_years):
 # =============================================================================
 
 def process_year_data(year, params, global_params):
+    """Processes a single year: merges sensors, applies calibration, and saves CSV."""
     year_files = list(config.OUTPUT_DIR.glob(f"NDVI_*_{year}*.zip")) + list(config.OUTPUT_DIR.glob(f"NDVI_*_{year}*.csv"))
     if not year_files:
         return None
@@ -433,6 +458,7 @@ def create_decadal_zips(processed_years):
         logger.info(f"✓ Created {zip_name} with {len(decade_years)} years")
 
 def process_annual_data(start_year=None, start_month=None, end_year=None, end_month=None):
+    """Orchestrates the parallel processing of annual data and harmonization."""
     logger.info("Processing annual data in parallel by year...")
     
     all_files = list(config.OUTPUT_DIR.glob("NDVI_*_*.zip")) + list(config.OUTPUT_DIR.glob("NDVI_*_*.csv"))
@@ -514,6 +540,7 @@ def process_annual_data(start_year=None, start_month=None, end_year=None, end_mo
 # =============================================================================
 
 def main():
+    """Main execution entry point for AVHRR/MODIS NDVI harmonization."""
     
     setup_logging(config.LOG_DIR, __file__)
     init_gee()

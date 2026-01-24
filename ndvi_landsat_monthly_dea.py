@@ -107,6 +107,17 @@ def compute_tile_hash(tile_path):
 
 
 def rasterize_tile_polygons(tile_id, tile_bounds, polygons, uid_to_int, total_pixels, tile_hashes):
+    """
+    Rasterizes polygons within a specific tile and updates pixel counts.
+
+    Args:
+        tile_id (int): Unique identifier for the tile.
+        tile_bounds (tuple): (minx, miny, maxx, maxy) bounds of the tile.
+        polygons (GeoDataFrame): The source polygons.
+        uid_to_int (dict): Mapping from UID string to integer ID.
+        total_pixels (dict): Dictionary to update with pixel counts per UID.
+        tile_hashes (dict): Dictionary to store hash of generated tile file.
+    """
     minx, miny, maxx, maxy = tile_bounds
     tile_geom = box(minx, miny, maxx, maxy)
     polys = polygons[polygons.intersects(tile_geom)]
@@ -156,6 +167,18 @@ def rasterize_tile_polygons(tile_id, tile_bounds, polygons, uid_to_int, total_pi
 
 
 def load_or_create_raster_tiles(polygons_path):
+    """
+    Loads existing raster tiles or generates them from the polygon shapefile.
+
+    Validates existing tiles against stored hashes. If validation fails or tiles
+    are missing, regenerates the entire tiling scheme.
+
+    Args:
+        polygons_path (Path): Path to the input polygon shapefile.
+
+    Returns:
+        list: List of dictionaries containing tile metadata (id, bounds).
+    """
     tiles_dir = config.OUTPUT_DIR / "tile_masks"
     mapping_file = config.OUTPUT_DIR / "uid_mapping.json"
 
@@ -332,6 +355,7 @@ def check_dask_graph(obj, name="object", max_tasks=None, max_partitions=None):
 
 
 def bbox_to_wgs84(bbox):
+    """Converts a bounding box from the project CRS to WGS84 (EPSG:4326)."""
     for i, x in enumerate(bbox):
         if not np.isfinite(x):
             raise ValueError(f"Invalid bbox coordinate at index {i}: {x} in {bbox}")
@@ -341,6 +365,7 @@ def bbox_to_wgs84(bbox):
 
 
 def stac_client():
+    """Initializes and returns a PySTAC Client for the configured STAC URL."""
     try:
         # Change 'request_session' to 'session'
         return Client.open(config.STAC_URL)
@@ -355,6 +380,7 @@ def log_memory():
 
 
 def load_tile_mask(tile_id):
+    """Loads the raster mask for a specific tile ID from disk."""
     tiles_file = config.OUTPUT_DIR / "tile_masks" / f"tile_{tile_id:05d}.tif"
     if tiles_file.exists():
         with rasterio.open(tiles_file) as src:
@@ -363,10 +389,23 @@ def load_tile_mask(tile_id):
 
 
 def compute_ndvi(red, nir):
+    """Computes Normalized Difference Vegetation Index (NDVI)."""
     return (nir - red) / (nir + red + 1e-6)
 
 
 def zonal_mean(ndvi, clear_mask, tiles, int_to_uid):
+    """
+    Computes zonal statistics (mean NDVI, counts) for polygons within a tile.
+
+    Args:
+        ndvi (xarray.DataArray): NDVI data for the tile.
+        clear_mask (xarray.DataArray): Boolean mask of clear pixels.
+        tiles (numpy.ndarray): Rasterized polygon IDs for the tile.
+        int_to_uid (dict): Mapping from integer raster IDs to string UIDs.
+
+    Returns:
+        pd.DataFrame: Zonal statistics for the tile, or None if no valid data.
+    """
     nd = ndvi.values
     cm = clear_mask.values
     lb = tiles
@@ -408,11 +447,13 @@ def zonal_mean(ndvi, clear_mask, tiles, int_to_uid):
 
 @delayed
 def process_tile_from_macro(tile, ndvi_med, clear_mask_med, tile_masks):
-    """Worker-level processing: loads mapping from local cache."""
+    """
+    Worker-level processing: loads mapping from local cache and computes zonal stats.
+    Processes a single sub-tile via spatial slicing from macro-region data.
+    """
     # Retrieve the mapping from the local process memory
     int_to_uid = get_mapping_on_worker()
     
-    """Process tile via spatial slicing from macro-region data."""
     tile_id = tile["tile_id"]
     cache_file = (
         config.OUTPUT_DIR
@@ -761,6 +802,7 @@ def process_month(year, month, raster_tiles, macro_tiles, dask_client, catalog):
 
 
 def main():
+    """Main execution entry point for Landsat NDVI processing."""
     setup_logging(config.LOG_DIR, "ndvi_processing")
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     

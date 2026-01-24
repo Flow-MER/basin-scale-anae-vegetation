@@ -40,6 +40,7 @@ def setup_logging(log_dir, script_name, file_level=logging.DEBUG, console_level=
     console_handler = logging.StreamHandler()
     console_handler.setLevel(console_level)
     console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    
     root_logger.addHandler(console_handler)
     
     logging.info(f"Logging to: {log_file}")

@@ -1,4 +1,12 @@
+"""
+ArcGIS-based Soil Moisture Extraction.
 
+This script uses ArcPy to process NetCDF soil moisture data, performing zonal statistics
+against a polygon shapefile. It handles multidimensional rasters (CRF) and exports
+results to CSVs, which are then merged and zipped.
+
+Note: Requires an environment with ArcPy installed (e.g., ArcGIS Pro).
+"""
 import os
 import sys
 import arcpy
@@ -14,6 +22,7 @@ from config import soil_moisture_cfg as config
 arcpy.env.overwriteOutput = True
 
 def build_year_tasks(nc_path, start_year, end_year, time_var="time"):
+    """Generates a list of (year, start_date, end_date) tuples for processing."""
     # open dataset
     ds = xr.open_dataset(nc_path)
     
@@ -46,20 +55,20 @@ def process_year(year, start_date, end_date, zonefile):
     crf_path = rf"D:\BWSVulnerability\climate\sm_pct_relative_monthly_{year}.crf"
     result_table = os.path.join(arcpy.env.scratchFolder,f"ZonalSt30_soilmoistureanomally_monthly_{year}.dbf")
     csv_path = os.path.join(arcpy.env.scratchFolder,f"zonal_soilmoisture{year}.csv")
-    
+
     extent = arcpy.Describe(zonefile).extent
     spatialRef = arcpy.Describe(zonefile).spatialReference
-    
+
     with arcpy.EnvManager(outputCoordinateSystem=spatialRef, extent=extent, cellSize=zonefile):
         # Subset multidimensional raster
         arcpy.md.SubsetMultidimensionalRaster(
-            in_multidimensional_raster=config.ROOT_ZONE_SOIL_MOISTURE_RELATIVE,
+            in_multidimensional_raster=config.LOCAL_ROOT_ZONE_SOIL_MOISTURE_RELATIVE_NETCDF_PATH,
             out_multidimensional_raster=crf_path,
             variables=config.SM_VAR,
             dimension_def="BY_RANGES",
-            dimension_ranges=f"StdTime {start_date} {end_date}"
+            dimension_ranges=f"StdTime {start_date} {end_date}",
         )
-        
+
         # Zonal statistics
         arcpy.ia.ZonalStatisticsAsTable(
             in_zone_data=zonefile,
@@ -70,7 +79,7 @@ def process_year(year, start_date, end_date, zonefile):
             statistics_type="MEAN",
             process_as_multidimensional="ALL_SLICES"
         )
-        
+
         arcpy.conversion.ExportTable(
             in_table=result_table,
             out_table=csv_path,
@@ -80,6 +89,7 @@ def process_year(year, start_date, end_date, zonefile):
     return csv_path
 
 def merge_csv(file_list, out_file):
+    """Merges multiple CSV files into a single compressed CSV."""
     # read all CSVs into dataframes
     dfs = [pd.read_csv(f) for f in file_list]
     merged = pd.concat(dfs, ignore_index=True)

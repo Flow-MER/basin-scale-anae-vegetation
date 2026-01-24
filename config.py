@@ -1,3 +1,11 @@
+"""
+Configuration settings for FlowMER2.0 vegetation vulnerability processing.
+
+Defines paths, constants, and parameters for:
+- Landsat NDVI processing (DEA)
+- AVHRR/MODIS NDVI harmonization (GEE)
+- Soil Moisture processing (AWO/THREDDS)
+"""
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List
@@ -6,6 +14,7 @@ import multiprocessing as mp
 
 @dataclass(frozen=True)
 class BaseConfig:
+    """Base configuration with shared paths and constants."""
     BASE_DIR: Path = Path(__file__).parent
     INPUT_DIR: Path = BASE_DIR / "input/spatial"
     OUTPUT_DIR: Path = BASE_DIR / "output"
@@ -16,6 +25,7 @@ class BaseConfig:
 
 @dataclass(frozen=True)
 class NDVILandsatConfig(BaseConfig):
+    """Configuration for Landsat NDVI processing via DEA."""
     TASK_NAME: str = "ndvi"
     OUTPUT_DIR: Path = BaseConfig.OUTPUT_DIR / "ndvi/landsat"
     STAC_URL: str = "https://explorer.dea.ga.gov.au/stac"
@@ -36,6 +46,7 @@ class NDVILandsatConfig(BaseConfig):
 
 @dataclass(frozen=True)
 class NDVIAvhrrModisConfig(BaseConfig):
+    """Configuration for AVHRR/MODIS NDVI harmonization via GEE."""
     OUTPUT_DIR: Path = BaseConfig.OUTPUT_DIR / "ndvi/avhrr_modis"
     GEE_ASSET_ID: str = "projects/ee-litepc/assets/ANAEv3_gt1ha"
     START_DATE: tuple = (1986, 1)
@@ -58,17 +69,24 @@ class NDVIAvhrrModisConfig(BaseConfig):
 
 @dataclass(frozen=True)
 class SoilMoistureConfig(BaseConfig):
+    """Configuration for Soil Moisture processing via NCI THREDDS."""
     OUTPUT_DIR: Path = BaseConfig.OUTPUT_DIR / "soil_moisture"
     CACHE_DIR: Path = OUTPUT_DIR / "cache"
-    ROOT_ZONE_SOIL_MOISTURE_RELATIVE: Path = BaseConfig.INPUT_DIR / "sm_pct.nc"
+    THREDDS_AWO_ROOT_ZONE_SOIL_MOISTURE_BASE_URL: str = (
+        "https://thredds.nci.org.au/thredds/ncss/grid/iu04/australian-water-outlook/historical/v1/AWRALv7/processed/deciles/month/sm_pct.nc"
+    )
+    LOCAL_ROOT_ZONE_SOIL_MOISTURE_RELATIVE_NETCDF_PATH: Path = (
+        BaseConfig.INPUT_DIR / "sm_pct.nc"
+    )
     SM_VAR: str = "sm_pct"
     START_DATE: str = "1986-01-31"
     END_DATE: str | None = None  # None = use last month in netcdf
     CRS_FALLBACK: str = "EPSG:4326" #WGS_84 matches netcdf
-    DASK_N_WORKERS_OVERRIDE: int = 16 # Number of Dask workers to use
+    DASK_N_WORKERS_OVERRIDE: int = (
+        16  # Number of Dask workers to use this script benefits from more workers
+    )
     BATCH_SIZE: int = 12  # Number of months to process in one Dask batch
-    BLOCK_SIZE: int = 5000  # Number of polygons per Dask worker to process together
-
+    BLOCK_SIZE: int = 5000  # Number of polygons per Dask worker to process together.
 
 
 ndvi_landsat_cfg = NDVILandsatConfig()
