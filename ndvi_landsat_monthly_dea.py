@@ -53,7 +53,7 @@ from config import ndvi_landsat_cfg as config
 logger = logging.getLogger(__name__)
 
 #silence info logs from rasterio warp during dask startup
-logging.getLogger(rasterio).setLevel(logging.WARNING)
+logging.getLogger("rasterio").setLevel(logging.WARNING)
 
 
 # =========================
