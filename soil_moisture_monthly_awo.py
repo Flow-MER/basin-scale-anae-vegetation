@@ -23,6 +23,7 @@ from tools.dask import start_dask
 from tools.logging_setup import setup_logging
 from config import soil_moisture_cfg as config
 from dask.distributed import as_completed
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +281,39 @@ def download_mdb_soilmoisture_subset(
         raise
 
 
+def load_and_scatter_polygons(dask_client, polygon_path, target_crs, unique_id, block_size, gdf=None):
+    """
+    Loads (or uses existing) polygons, projects them, splits into blocks, and scatters to Dask workers.
+    Returns a list of Dask futures for the blocks.
+    """
+    logger.info("Preparing polygon blocks for scatter...")
+    
+    # Load if not provided
+    if gdf is None:
+        logger.info(f"Reading shapefile {polygon_path}...")
+        gdf = gpd.read_file(polygon_path, columns=[unique_id, "geometry"])
+    
+    # Project if needed
+    if gdf.crs and gdf.crs.to_epsg() != target_crs.to_epsg():
+        logger.info(f"Projecting polygons to {target_crs}...")
+        gdf = gdf.to_crs(target_crs)
+        
+    # Split into blocks
+    logger.info(f"Splitting {len(gdf)} polygons into blocks of {block_size}...")
+    total_polygons = len(gdf)
+    blocks = [gdf.iloc[i : i + block_size].copy() for i in range(0, total_polygons, block_size)]
+    
+    # Scatter
+    logger.info("Scattering blocks to workers...")
+    futures = [dask_client.scatter(block) for block in blocks]
+    
+    # Explicit cleanup
+    del gdf
+    del blocks
+    gc.collect()
+    
+    return futures
+
 def compute_zonal_statistics(
     polygon_shapefile,
     unique_id,
@@ -368,82 +402,92 @@ def compute_zonal_statistics(
     y_dim = da.rio.y_dim    
     da = da.chunk({x_dim: 512, y_dim: 512, "time": 1})
 
-    # Load and reproject polygons to match raster CRS
-    logger.info(f"Projecting shapefile to {target_crs}...")
-    try:
-        if gdf is None:
-            gdf = gpd.read_file(polygon_shapefile, columns=[unique_id, "geometry"])
+    # Initialize Dask distributed client
+    dask_client = start_dask(workers=n_workers)
 
-        if gdf.crs and gdf.crs.to_epsg() != target_crs.to_epsg():
-            gdf = gdf.to_crs(target_crs)
+    # Initial scatter
+    try:
+        gdf_block_futures = load_and_scatter_polygons(
+            dask_client, polygon_shapefile, target_crs, unique_id, block_size, gdf
+        )
     except Exception as e:
-        logger.error(f"Failed to read/project shapefile {polygon_shapefile}: {e}")
+        logger.error(f"Failed to prepare polygons: {e}")
         ds.close()
         return return_value
 
-    # Initialize Dask distributed client
-    client = start_dask(workers=n_workers)
-
-    # Split GeoDataFrame into blocks and scatter to workers ONCE (avoid repeated transfers)
-    logger.info("Splitting GeoDataFrame into memory-resident blocks...")
-    total_polygons = len(gdf)
-    gdf_blocks = [gdf.iloc[i : i + block_size].copy() for i in range(0, total_polygons, block_size)]
-    gdf_block_futures = [client.scatter(block) for block in gdf_blocks]
-
-    # Clean up local copies
-    del gdf, gdf_blocks
+    # Clean up local gdf if it was passed in
+    if gdf is not None:
+        del gdf
     gc.collect()
     # Process months in batches to control memory usage
     for batch_start in range(0, len(job_list), batch_size):
         batch = job_list[batch_start:batch_start + batch_size]
         write_tasks = []
 
-        # Process each month in the batch
-        for year, month, i in batch:
-            # Load single month raster and scatter to workers
-            month_da = da.isel(time=i).squeeze().compute()
-            month_future = client.scatter(month_da)
+        # Retry logic to handle worker crashes (e.g. OOM) or lost scattered data
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    logger.info("Retrying batch: Re-reading and re-scattering polygon blocks...")
+                    gdf_block_futures = load_and_scatter_polygons(
+                        dask_client, polygon_shapefile, target_crs, unique_id, block_size, gdf=None
+                    )
 
-            # Create tasks for all polygon blocks for this month
-            month_tasks = [
-                process_polygon_block_lazy(month_future, block_fut, year, month, unique_id)
-                for block_fut in gdf_block_futures
-            ]
+                # Process each month in the batch
+                for year, month, i in batch:
+                    # Load single month raster and scatter to workers
+                    month_da = da.isel(time=i).squeeze().compute()
+                    month_future = dask_client.scatter(month_da)
 
-            # Chain write task after computation
-            write_tasks.append(
-                write_month_parquet(month_tasks, str(cache_dir), variable_name, unique_id)
-            )
+                    # Create tasks for all polygon blocks for this month
+                    month_tasks = [
+                        process_polygon_block_lazy(month_future, block_fut, year, month, unique_id)
+                        for block_fut in gdf_block_futures
+                    ]
 
-            # Clean up month data immediately
-            del month_da
+                    # Chain write task after computation
+                    write_tasks.append(
+                        write_month_parquet(month_tasks, str(cache_dir), variable_name, unique_id)
+                    )
 
-        # Execute batch: compute zonal stats + write parquet files in parallel
-        logger.info(f"Computing batch {batch_start//batch_size + 1}: {len(write_tasks)} months")
+                    # Clean up month data immediately
+                    del month_da
 
-        # Submit tasks and get futures for progress tracking
-        futures = client.compute(write_tasks, sync=False)
+                # Execute batch: compute zonal stats + write parquet files in parallel
+                logger.info(f"Computing batch {batch_start//batch_size + 1}: {len(write_tasks)} months")
 
-        # Log progress as tasks complete
-        completed_count = 0
-        for future in as_completed(futures):
-            completed_count += 1
-            logger.info(f"Progress: {completed_count}/{len(futures)} months completed")
+                # Submit tasks and get futures for progress tracking
+                futures = dask_client.compute(write_tasks, sync=False)
 
-        # Gather results
-        written_files = client.gather(futures)
+                # Log progress as tasks complete
+                completed_count = 0
+                for future in as_completed(futures):
+                    completed_count += 1
+                    logger.info(f"Progress: {completed_count}/{len(futures)} months completed")
 
-        # Force garbage collection on all workers and locally
-        client.run(gc.collect)
-        gc.collect()
+                # Gather results
+                written_files = dask_client.gather(futures)
 
-        # Log results
-        for filepath in written_files:
-            if isinstance(filepath, str) and filepath.startswith("Failed"):
-                logger.error(filepath)
-            else:
-                logger.info(f"Saved {filepath}")
-                return_value = True
+                # Force garbage collection on all workers and locally
+                dask_client.run(gc.collect)
+                gc.collect()
+
+                # Log results
+                for filepath in written_files:
+                    if isinstance(filepath, str) and filepath.startswith("Failed"):
+                        logger.error(filepath)
+                    else:
+                        logger.info(f"Saved {filepath}")
+                        return_value = True
+                break
+            except Exception as e:
+                logger.warning(f"Batch {batch_start//batch_size + 1} failed  {attempt + 1}/{max_retries}: {e}")
+                dask_client.run(gc.collect)
+                if attempt == max_retries - 1:
+                    raise e
+                time.sleep(5)
+    
 
     # Cleanup scattered futures and close dataset
     del gdf_block_futures
