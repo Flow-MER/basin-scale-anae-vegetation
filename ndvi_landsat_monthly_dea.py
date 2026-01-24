@@ -52,9 +52,6 @@ from tools.dask import start_dask
 from config import ndvi_landsat_cfg as config
 logger = logging.getLogger(__name__)
 
-#silence info logs from rasterio warp during dask startup
-logging.getLogger(rasterio).setLevel(logging.WARNING)
-
 
 # =========================
 # SPATIAL GRID
@@ -728,22 +725,14 @@ def process_month(year, month, raster_tiles, macro_tiles, dask_client, catalog):
     for macro_tile in macro_tiles:
         logger.info(f"Macro-tile {macro_tile['macro_id']} - {year}-{month:02d} - memory use: {log_memory()}")
         
-        # Retry logic to handle worker crashes (e.g. OOM) or lost scattered data
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                res = process_macro_tile(
-                    macro_tile, year, month, items, wofs_items,
-                )
-                if res:
-                    all_results.extend(res)
-                break
-            except Exception as e:
-                logger.warning(f"Macro-tile {macro_tile['macro_id']} failed attempt {attempt + 1}/{max_retries}: {e}")
-                dask_client.run(gc.collect)
-                if attempt == max_retries - 1:
-                    raise e
-                time.sleep(5)
+        # This call now runs on the main thread, but triggers 
+        # parallel work on the workers via dask.compute() inside
+        res = process_macro_tile(
+            macro_tile, year, month, items, wofs_items,
+        )
+        
+        if res:
+            all_results.extend(res)
         
         # FORCE CLEANUP: Tell all workers to clear memory before next macro-tile
         dask_client.run(gc.collect)
