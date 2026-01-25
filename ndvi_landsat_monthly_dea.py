@@ -52,9 +52,16 @@ from tools.dask import start_dask
 from config import ndvi_landsat_cfg as config
 logger = logging.getLogger(__name__)
 
-#silence info logs from rasterio warp during dask startup
-logging.getLogger("rasterio").setLevel(logging.WARNING)
+#silence noisy warning from rasterio vs lazy loading xarray
 
+import warnings
+from rasterio.errors import NotGeoreferencedWarning
+
+warnings.filterwarnings(
+    "ignore",
+    message="Dataset has no geotransform",
+    category=NotGeoreferencedWarning
+)  
 
 # =========================
 # SPATIAL GRID

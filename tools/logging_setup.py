@@ -31,7 +31,7 @@ def setup_logging(log_dir, script_name, file_level=logging.DEBUG, console_level=
     root_logger.handlers.clear()
     
     # File handler
-    file_handler = logging.FileHandler(log_file)
+    file_handler = logging.FileHandler(log_file, encoding = 'utf-8')
     file_handler.setLevel(file_level)
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     root_logger.addHandler(file_handler)

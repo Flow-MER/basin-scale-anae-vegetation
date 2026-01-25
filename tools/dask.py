@@ -53,7 +53,7 @@ def start_dask(workers=None):
             # Important: Keep connections open between internal rasterio/gdal calls
             "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
 
-            # Use persistent connections across your workers
+            # Use persistent connections across workers
             "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff,.vrt",
         },
     )
@@ -61,6 +61,8 @@ def start_dask(workers=None):
     logger.info(f"Dask cluster: {n_workers} workers")
     logger.info(f"  x {threads_per_worker} threads per worker")
     logger.info(f"  x {memory_limit_per_worker} GB worker memory limit")
-    logger.info(f"Dashboard: http://127.0.0.1:{config.DASK_DASHBOARD_PORT}/status")
+    logger.info(f"{50*'='}")
+    logger.info(f"Dask Dashboard: http://127.0.0.1:{config.DASK_DASHBOARD_PORT}/status")
+    logger.info(f"{50*'='}")
 
     return DaskClient(cluster)
