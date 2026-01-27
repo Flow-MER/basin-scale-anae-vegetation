@@ -11,7 +11,10 @@ env/
 .env
 *.csv
 *.zip
+*.pyc
+*text.md
 ndvi/
+dev/
 ndvi_landsat/
 soil_moisture/
 log/
@@ -23,8 +26,5 @@ data/
 *.nc
 
 *.code-workspace
-.cspell/custom-dictionary-workspace.txt
-avhrr_modis_output/
-landsat_ndvi_output/
-.gitignore
-*.pyc
+.cspell/
+

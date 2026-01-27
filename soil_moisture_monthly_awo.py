@@ -177,26 +177,53 @@ def download_mdb_soilmoisture_subset(
         should_download = True
     elif meta_end_str:
         remote_end_dt = pd.to_datetime(meta_end_str)
-        remote_ym = (remote_end_dt.year, remote_end_dt.month)
 
-        existing_months = get_existing_months(cache_dir)
-        if existing_months:
-            last_cached_ym = max(existing_months)
+        # If remote date is timezone-aware (e.g., from 'Z' suffix), make it naive.
+        # This prevents 'Cannot compare tz-naive and tz-aware timestamps' errors
+        # when comparing against the local NetCDF time, which is naive.
+        if remote_end_dt.tz:
+            remote_end_dt = remote_end_dt.tz_localize(None)
 
-            if remote_ym < last_cached_ym:
-                logger.error(
-                    f"ALERT: Remote NetCDF end date ({remote_end_dt:%Y-%m-%d}) is earlier than most recent cached result ({last_cached_ym}). Potential date alignment problem!"
-                )
-                should_download = False
-            elif remote_ym == last_cached_ym:
+        # Check if local file is already up to date
+        local_is_current = False
+        try:
+            with xr.open_dataset(output_path, chunks={}) as ds:
+                local_end_dt = pd.to_datetime(ds.time.values[-1])
+
+            # Compare year/month only to avoid day mismatch (e.g. 1st vs 31st)
+            if (local_end_dt.year, local_end_dt.month) >= (
+                remote_end_dt.year,
+                remote_end_dt.month,
+            ):
+                local_is_current = True
                 logger.info(
-                    f"Remote NetCDF end date ({remote_end_dt:%Y-%m-%d}) already in local cache. Skipping download."
+                    f"Local NetCDF up to date ({local_end_dt:%Y-%m-%d}). Skipping download."
                 )
-                should_download = False
-            else:
-                logger.info(
-                    f"New data available (Remote: {remote_ym} > Cache: {last_cached_ym}). Downloading soil moisture data..."
-                )
+        except Exception as e:
+            logger.warning(f"Could not check local NetCDF date: {e}")
+
+        if local_is_current:
+            should_download = False
+        else:
+            remote_ym = (remote_end_dt.year, remote_end_dt.month)
+            existing_months = get_existing_months(cache_dir)
+            if existing_months:
+                last_cached_ym = max(existing_months)
+
+                if remote_ym < last_cached_ym:
+                    logger.error(
+                        f"ALERT: Remote NetCDF end date ({remote_end_dt:%Y-%m-%d}) is earlier than most recent cached result ({last_cached_ym}). Potential date alignment problem!"
+                    )
+                    should_download = False
+                elif remote_ym == last_cached_ym:
+                    logger.info(
+                        f"Remote NetCDF end date ({remote_end_dt:%Y-%m-%d}) already in local cache. Skipping download."
+                    )
+                    should_download = False
+                else:
+                    logger.info(
+                        f"New data available (Remote: {remote_ym} > Cache: {last_cached_ym}). Downloading soil moisture data..."
+                    )
     else:
         logger.info(
             f"NetCDF file exists at {output_path} and metadata unavailable, skipping download."
@@ -436,7 +463,8 @@ def compute_zonal_statistics(
 
                 # Process each month in the batch
                 for year, month, i in batch:
-                    # Load single month raster and scatter to workers
+                    # Load single month raster and scatter to workers. Reduces dask schedular overhead.
+                    # faster because it preps shared in-memory arrays for Exact_extract workers that are not dask aware.
                     month_da = da.isel(time=i).squeeze().compute()
                     month_future = dask_client.scatter(month_da)
 
