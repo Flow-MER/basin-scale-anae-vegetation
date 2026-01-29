@@ -10,20 +10,32 @@ import xarray as xr
 import rioxarray
 import numpy as np
 import pandas as pd
-from dask import delayed
-from pathlib import Path
 import logging
 import requests
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from urllib.parse import urlencode
 from datetime import datetime
-import xml.etree.ElementTree as ET
+from dask import delayed
+from dask.distributed import as_completed
 
 from exactextract import exact_extract
+import time
+
+import sys
+# Add project root to sys.path to allow imports from config.py and tools/
+# This handles cases where the script is moved to a subfolder (e.g., input_pipelines/)
+current_dir = Path(__file__).resolve().parent
+if (current_dir / "config.py").exists():
+    project_root = current_dir
+else:
+    project_root = current_dir.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 from tools.dask import start_dask
 from tools.logging_setup import setup_logging
 from config import soil_moisture_cfg as config
-from dask.distributed import as_completed
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -430,7 +442,7 @@ def compute_zonal_statistics(
     da = da.chunk({x_dim: 512, y_dim: 512, "time": 1})
 
     # Initialize Dask distributed client
-    dask_client = start_dask(workers=n_workers)
+    dask_client = start_dask()
 
     # Initial scatter
     try:
@@ -604,7 +616,7 @@ def main():
             config.CACHE_DIR,
             config.END_DATE,
             gdf=gdf,
-            unique_id=config.POLY_UID,
+            unique_id=config.POLY_UNIQUE_ID,
         )
     except Exception as e:
         logger.warning(
@@ -614,7 +626,7 @@ def main():
     try:
         if compute_zonal_statistics(
             polygon_shapefile=config.POLYGON_PATH,
-            unique_id=config.POLY_UID,
+            unique_id=config.POLY_UNIQUE_ID,
             cache_dir=config.CACHE_DIR,
             output_dir=config.OUTPUT_DIR,
             netcdf_file=config.LOCAL_ROOT_ZONE_SOIL_MOISTURE_RELATIVE_NETCDF_PATH,
@@ -624,7 +636,7 @@ def main():
             batch_size=config.BATCH_SIZE,
             gdf=gdf,
         ):
-            aggregate_parquets(config.CACHE_DIR, config.OUTPUT_DIR, config.POLY_UID, config.SM_VAR)
+            aggregate_parquets(config.CACHE_DIR, config.OUTPUT_DIR, config.POLY_UNIQUE_ID, config.SM_VAR)
         logger.info("Processing complete")
     except Exception as e:
         logger.error(f"Processing failed: {e}", exc_info=True)

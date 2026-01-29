@@ -46,6 +46,18 @@ import time
 from tqdm import tqdm
 from dask import delayed, compute as dask_compute
 from dask.distributed import Future, get_client
+
+import sys
+# Add project root to sys.path to allow imports from config.py and tools/
+# This handles cases where the script is moved to a subfolder (e.g., input_pipelines/)
+current_dir = Path(__file__).resolve().parent
+if (current_dir / "config.py").exists():
+    project_root = current_dir
+else:
+    project_root = current_dir.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 from tools.logging_setup import setup_logging
 from tools.dask import start_dask
 
@@ -142,7 +154,7 @@ def rasterize_tile_polygons(tile_id, tile_bounds, polygons, uid_to_int, total_pi
         minx, miny, maxx, maxy, config.TILE_PIXELS, config.TILE_PIXELS
     )
     polys_mapped = polys.copy()
-    polys_mapped["raster_id"] = polys_mapped[config.POLY_UID].map(uid_to_int)
+    polys_mapped["raster_id"] = polys_mapped[config.POLY_UNIQUE_ID].map(uid_to_int)
 
     shapes = zip(polys_mapped.geometry, polys_mapped["raster_id"])
     tiles = rasterize(
@@ -154,7 +166,7 @@ def rasterize_tile_polygons(tile_id, tile_bounds, polygons, uid_to_int, total_pi
     )
 
     unique, counts = np.unique(tiles[tiles > 0], return_counts=True)
-    uid_to_string = polys_mapped.set_index("raster_id")[config.POLY_UID].to_dict()
+    uid_to_string = polys_mapped.set_index("raster_id")[config.POLY_UNIQUE_ID].to_dict()
     for uid_int, count in zip(unique, counts):
         uid = uid_to_string[uid_int]
         total_pixels[uid] = total_pixels.get(uid, 0) + count
@@ -237,7 +249,7 @@ def load_or_create_raster_tiles(polygons_path):
 
     polygons = gpd.read_file(polygons_path).to_crs(config.CRS)
     
-    unique_uids = sorted(polygons[config.POLY_UID].unique())
+    unique_uids = sorted(polygons[config.POLY_UNIQUE_ID].unique())
     uid_to_int = {uid: i + 1 for i, uid in enumerate(unique_uids)}
 
     minx, miny, maxx, maxy = polygons.total_bounds
@@ -444,7 +456,7 @@ def zonal_mean(ndvi, clear_mask, tiles, int_to_uid):
     valid_mask = [u is not None for u in string_uids]
     
     return pd.DataFrame({
-        config.POLY_UID: [u for u in string_uids if u is not None],
+        config.POLY_UNIQUE_ID: [u for u in string_uids if u is not None],
         "ndvi": means[valid_mask],
         "count": counts[valid_mask],
         "clear_pixels": clear_counts[valid_mask],
@@ -757,13 +769,13 @@ def process_month(year, month, raster_tiles, macro_tiles, dask_client, catalog):
 
     if not all_results:
         logger.info(f"  No results for {year}-{month:02d}. Creating empty baseline.")
-        combined = pd.DataFrame(columns=[config.POLY_UID, "ndvi", "count", "clear_pixels", "w_ndvi"])
+        combined = pd.DataFrame(columns=[config.POLY_UNIQUE_ID, "ndvi", "count", "clear_pixels", "w_ndvi"])
     else:
         combined = pd.concat(all_results, ignore_index=True)
         combined["w_ndvi"] = combined["ndvi"] * combined["count"]
 
     aggregated = (
-        combined.groupby(config.POLY_UID)
+        combined.groupby(config.POLY_UNIQUE_ID)
         .agg(
             w_ndvi_sum=("w_ndvi", "sum"),
             count_sum=("count", "sum"),
@@ -775,10 +787,10 @@ def process_month(year, month, raster_tiles, macro_tiles, dask_client, catalog):
     mapping_file = config.OUTPUT_DIR / "uid_mapping.json"
     with open(mapping_file) as f:
         data = json.load(f)
-    all_uids_df = pd.DataFrame(data["polygons"], columns=["int_value", config.POLY_UID, "total_pixels"])
-    all_uids_df = all_uids_df[[config.POLY_UID, "total_pixels"]]  # Keep only UID and pixel count
+    all_uids_df = pd.DataFrame(data["polygons"], columns=["int_value", config.POLY_UNIQUE_ID, "total_pixels"])
+    all_uids_df = all_uids_df[[config.POLY_UNIQUE_ID, "total_pixels"]]  # Keep only UID and pixel count
 
-    final_result = all_uids_df.merge(aggregated, on=config.POLY_UID, how="left")
+    final_result = all_uids_df.merge(aggregated, on=config.POLY_UNIQUE_ID, how="left")
 
     final_result["w_ndvi_sum"] = final_result["w_ndvi_sum"].fillna(0)
     final_result["count_sum"] = final_result["count_sum"].fillna(0)
