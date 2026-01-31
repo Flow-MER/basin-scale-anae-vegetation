@@ -17,7 +17,6 @@ SCALABILITY:
 - 98% reduction in network I/O
 """
 
-import os
 import gc
 import json
 import logging
@@ -463,6 +462,117 @@ def zonal_mean(ndvi, clear_mask, tiles, int_to_uid):
     })
 
 
+def search_stac_collection(catalog, collections, bbox, start_date, end_date, description):
+    """Helper to search STAC catalog with error handling."""
+    logger.info(f"  Searching for {description} data {start_date} to {end_date}...")
+    try:
+        items = catalog.search(
+            collections=collections,
+            bbox=bbox,
+            datetime=f"{start_date}/{end_date}",
+            limit=300,
+        ).item_collection()
+    except Exception as e:
+        logger.error(f"  {description} STAC search failed: {e}")
+        return None
+    
+    if len(items) == 0:
+        logger.info(f"  No {description} data for {start_date[:7]}")
+        return None
+        
+    logger.info(f"  - Found {len(items)} {description} items")
+    return items
+
+
+def load_landsat_macro(items, bbox_wgs84, macro_id, year, month):
+    """Loads Landsat data, computes NDVI and clear mask for a macro-tile."""
+    logger.debug(f"   Macro-tile {macro_id}: loading landsat data...")
+    try:
+        landsat_ds = odc.stac.load(
+            items,
+            bands=["nbart_red", "nbart_nir", "oa_fmask"],
+            bbox=bbox_wgs84,
+            crs=config.CRS,
+            resolution=30,
+            groupby="solar_day",
+            chunks={"time": 1, "x": config.TILE_PIXELS, "y": config.TILE_PIXELS},
+            fail_on_error=False,
+        )
+    except Exception as e:
+        logger.error(f"Landsat load failed for macro-tile {macro_id}: {e}")
+        return None, None
+
+    if (
+        landsat_ds is None
+        or landsat_ds.time.size == 0
+        or landsat_ds.sizes["x"] == 0
+        or landsat_ds.sizes["y"] == 0
+    ):
+        logger.warning(f"      Landsat: no data for macro-tile {macro_id} ({year}-{month:02d})")
+        return None, None
+
+    logger.info(f"   Loaded {landsat_ds.time.size}/{len(items)} Landsat scenes for macro-tile {macro_id}")
+
+    landsat_ds = landsat_ds.persist()
+    check_dask_graph(landsat_ds, "landsat_ds after persist")
+    logger.debug(f"      Memory after Landsat load: {log_memory()}")
+
+    # Clear mask & NDVI
+    clear_mask = ((landsat_ds.oa_fmask == 1) | (landsat_ds.oa_fmask == 5)).persist()
+
+    if clear_mask.isnull().all():
+        logger.info(f"      Macro-tile {macro_id}: no clear pixels ({year}-{month:02d})")
+        return None, None
+
+    landsat_ds["nbart_red"] = landsat_ds.nbart_red.where(clear_mask)
+    landsat_ds["nbart_nir"] = landsat_ds.nbart_nir.where(clear_mask)
+
+    ndvi = compute_ndvi(landsat_ds.nbart_red, landsat_ds.nbart_nir).persist()
+    del landsat_ds
+    logger.debug(f"      Memory after NDVI compute: {log_memory()}")
+    
+    return ndvi, clear_mask
+
+
+def apply_wofs_mask(ndvi, wofs_items, bbox_wgs84, macro_id):
+    """Loads WOfS data and masks open water from NDVI."""
+    logger.debug(f"   Macro-tile {macro_id}: loading WOfS data and open water mask")
+    try:
+        wofs_data = odc.stac.load(
+            wofs_items,
+            bbox=bbox_wgs84,
+            crs=config.CRS,
+            resolution=30,
+            groupby="solar_day",
+            chunks={"time": 1, "x": config.TILE_PIXELS, "y": config.TILE_PIXELS},
+            fail_on_error=False,
+        )
+        if (
+            wofs_data is not None
+            and "water" in wofs_data
+            and wofs_data.time.size > 0
+        ):
+            logger.info(f"   Loaded {wofs_data.time.size}/{len(wofs_items)} WOfS scenes for macro-tile {macro_id}")
+            wofs_data = wofs_data.persist()
+            water_int = wofs_data.water.fillna(0).astype("uint8")
+            quality_mask = (water_int & 0b01100011) == 0
+            open_water = (water_int & (1 << 7)) > 0
+            vegetation_mask = ~open_water & quality_mask
+            
+            ndvi_masked = ndvi.where(vegetation_mask)
+            
+            masked_pixels = vegetation_mask.sum().compute()
+            logger.debug(
+                f"      WOfS applied, {masked_pixels:.0f} open water pixels masked"
+            )
+            del wofs_data, vegetation_mask, water_int
+            return ndvi_masked
+    except Exception as e:
+        logger.warning(f"WOfS load or masking failed: {e}", exc_info=True)
+    
+    return ndvi
+
+
 # =========================
 # MACRO-REGION PROCESSING
 # =========================
@@ -566,87 +676,13 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
     
     dask_client = get_client()
     tile_masks_future = dask_client.scatter(tile_masks, broadcast=True)
-    logger.debug(f"   Macro-tile {macro_id}: loading landsat data...")
-    try:
-        landsat_ds = odc.stac.load(
-            items,
-            bands=["nbart_red", "nbart_nir", "oa_fmask"],
-            bbox=bbox_wgs84,
-            crs=config.CRS,
-            resolution=30,
-            groupby="solar_day",
-            chunks={"time": 1, "x": config.TILE_PIXELS, "y": config.TILE_PIXELS},
-            fail_on_error=False,
-        )
-    except Exception as e:
-        logger.error(f"Landsat load failed for macro-tile {macro_id}: {e}")
-        return cached_tiles
     
-    if (
-        landsat_ds is None
-        or landsat_ds.time.size == 0
-        or landsat_ds.sizes["x"] == 0
-        or landsat_ds.sizes["y"] == 0
-    ):
-        logger.warning(f"      Landsat: no data for macro-tile {macro_id} ({year}-{month:02d})")
-        return cached_tiles
-    else:
-        logger.info(f"   Loaded {landsat_ds.time.size}/{len(items)} Landsat scenes for macro-tile {macro_id}")
-
-    landsat_ds = landsat_ds.persist()
-    check_dask_graph(landsat_ds, "landsat_ds after persist")
-    logger.debug(f"      Memory after Landsat load: {log_memory()}")
-
-    # -------------------------
-    # Clear mask & NDVI
-    # -------------------------
-    clear_mask = ((landsat_ds.oa_fmask == 1) | (landsat_ds.oa_fmask == 5)).persist()
-
-    if clear_mask.isnull().all():
-        logger.info(f"      Macro-tile {macro_id}: no clear pixels ({year}-{month:02d})")
+    ndvi, clear_mask = load_landsat_macro(items, bbox_wgs84, macro_id, year, month)
+    if ndvi is None:
         return cached_tiles
 
-    landsat_ds["nbart_red"] = landsat_ds.nbart_red.where(clear_mask)
-    landsat_ds["nbart_nir"] = landsat_ds.nbart_nir.where(clear_mask)
-
-    ndvi = compute_ndvi(landsat_ds.nbart_red, landsat_ds.nbart_nir).persist()
-    del landsat_ds
-    logger.debug(f"      Memory after NDVI compute: {log_memory()}")
-
-    # -------------------------
-    # Apply WOfS if available
-    # -------------------------
-    logger.debug(f"   Macro-tile {macro_id}: loading WOfS data and open water mask")
     if wofs_items:
-        try:
-            wofs_data = odc.stac.load(
-                wofs_items,
-                bbox=bbox_wgs84,
-                crs=config.CRS,
-                resolution=30,
-                groupby="solar_day",
-                chunks={"time": 1, "x": config.TILE_PIXELS, "y": config.TILE_PIXELS},
-                fail_on_error=False,  # stop on failures to diagnose
-            )
-            if (
-                wofs_data is not None
-                and "water" in wofs_data
-                and wofs_data.time.size > 0
-            ):
-                logger.info(f"   Loaded {wofs_data.time.size}/{len(wofs_items)} WOfS scenes for macro-tile {macro_id}")
-                wofs_data = wofs_data.persist()
-                water_int = wofs_data.water.fillna(0).astype("uint8")
-                quality_mask = (water_int & 0b01100011) == 0
-                open_water = (water_int & (1 << 7)) > 0
-                vegetation_mask = ~open_water & quality_mask
-                ndvi = ndvi.where(vegetation_mask)
-                masked_pixels = vegetation_mask.sum().compute()
-                logger.debug(
-                    f"      WOfS applied, {masked_pixels:.0f} open water pixels masked"
-                )
-                del wofs_data, vegetation_mask, water_int
-        except Exception as e:
-            logger.warning(f"WOfS load or masking failed: {e}", exc_info=True)
+        ndvi = apply_wofs_mask(ndvi, wofs_items, bbox_wgs84, macro_id)
     else:
         logger.debug("WOfS data unavailable or empty")
 
@@ -707,40 +743,17 @@ def process_month(year, month, raster_tiles, macro_tiles, dask_client, catalog):
     start = f"{year}-{month:02d}-01"
     end = f"{year}-{month:02d}-{calendar.monthrange(year, month)[1]}"
 
+    items = search_stac_collection(
+        catalog, config.LANDSAT_COLLECTIONS, bbox_wgs84, start, end, "Landsat"
+    )
+    if not items:
+        return
 
-    
-    logger.info(f"  Searching for Landsat data {start} to {end}...")
-    try:
-        items = catalog.search(
-            collections=config.LANDSAT_COLLECTIONS,
-            bbox=bbox_wgs84,
-            datetime=f"{start}/{end}",
-            limit=300,
-        ).item_collection()
-    except Exception as e:
-        logger.error(f"  Landsat STAC search failed: {e}")
+    wofs_items = search_stac_collection(
+        catalog, [config.WOFS_COLLECTION], bbox_wgs84, start, end, "WOfS"
+    )
+    if not wofs_items:
         return
-    if len(items) == 0:
-        logger.info(f"  No Landsat data for {year}-{month:02d}")
-        return
-    logger.info(f"  - Found {len(items)} Landsat items")
-    
-    
-    logger.info(f"  Searching for WOfS data to mask open water {start} to {end}...")
-    try: 
-        wofs_items = catalog.search(
-            collections=[config.WOFS_COLLECTION],
-            bbox=bbox_wgs84,
-            datetime=f"{start}/{end}",
-            limit=300,
-        ).item_collection()
-    except Exception as e:
-        logger.error(f"  WOfS STAC search failed: {e}")
-        return
-    if len(wofs_items) == 0:
-        logger.info(f"  No WOfS data for {year}-{month:02d}")
-        return
-    logger.info(f"  - Found {len(wofs_items)} WOfS items")
 
     # Gathers results one macro-region at a time
     all_results = []
