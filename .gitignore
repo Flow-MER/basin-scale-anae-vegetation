@@ -6,6 +6,7 @@
 .gitignore
 .prj*
 .vscode/
+.coverage
 spatial/
 env/
 .env
