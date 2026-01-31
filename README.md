@@ -31,6 +31,19 @@ e.g.  pv_median_DIWA_5yr_condition.csv  is the median "pv" (green fractional cov
 2. threshold NDVI inputs to positive values only (limits influence of areas of open water)
 3. removed unvegetated ANAE classes (lakes, clay pans)
 
+### WIT Threshold - time since last inundation
+To quantify inundation and intervening dry periods for each wetland polygon, we derived a feature-specific inundation threshold from the long-term distribution of water extent. Monthly fractional inundation (expressed as the proportion of the polygon classified as open water or saturated substrate) was available for a 40-year period for each feature.
+
+For each polygon, an adaptive inundation threshold was defined as the 30th percentile (P30) of the long-term distribution of fractional inundation. This percentile-based approach provides a robust, non-parametric estimate of a characteristic wet condition while limiting sensitivity to extreme wet years, long inundated plateaus, and skewed or zero-inflated distributions commonly observed across heterogeneous wetland types. The use of a lower percentile intentionally biases the threshold toward conservative identification of ecologically meaningful re-wetting events, reflecting the assumption that false positive inundation detections are more detrimental to downstream vegetation stress estimates than delayed detection of inundation.
+
+To prevent spurious classification driven by noise or permanently inundated features, the adaptive threshold was constrained within fixed bounds. A minimum threshold of 0.05 (5% area) was imposed to exclude classification noise and trivial wetting in predominantly dry systems, while a maximum threshold of 0.5 was applied to prevent permanent or near-permanent water bodies from being classified as dry when below average water levels still cover the majority of the area. These bounds ensure consistency of inundation detection across ephemeral, seasonal, and perennial systems.
+
+A Time since last inundation (TSLI) metric is defined as the number of consecutive days since the most recent inundation event. TSLI was updated using a moving temporal window across the full time series, resetting to zero only when fractional inundation exceeded the threshold. Periods below the threshold increment TSLI monotonically, representing accumulating dry duration relevant to vegetation stress.
+
+To assess the sensitivity of TSLI to threshold selection, additional thresholds based on the 20th and 40th percentiles (P20 and P40) were also computed for all features. These alternative thresholds represent more conservative and more permissive inundation definitions, respectively, and provide bounds on uncertainty associated with threshold choice. Sensitivity analyses focused on the effects of threshold variation on derived TSLI metrics, rather than on inundation frequency alone, reflecting the primary role of inundation events as resets of hydrologic memory within vegetation stress modeling.
+
+
+
 ### Mapping the outputs
 
 * Patterns can be visualised in GIS by joining the output files to the relevant spatial layers.  Many of the vegetation maps in the report used the ANAE polygons scale to visualise the patterns - this was done by joining **FINAL_BWSVulnerability_vegetation_ANAE.csv** to the **ANAEv3** using the **UID** polygon identifier.  Mapping whole Valley aggregated scores would be done by joining **FINAL_BWSVulnerability_vegetation_Valley.csv** to **BWSRegions.shp** using the **BWS_Region**.
