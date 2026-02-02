@@ -22,6 +22,8 @@ class BaseConfig:
     TOOLS_DIR: Path = BASE_DIR / "tools"
     POLYGON_PATH: Path = INPUT_DIR / "ANAEv3_WIT.shp"
     POLY_UNIQUE_ID: str = "UID"
+    USE_CACHE: bool = True
+
 
 @dataclass(frozen=True)
 class NDVILandsatConfig(BaseConfig):

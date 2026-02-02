@@ -36,29 +36,59 @@ class RateLimiter:
             time.sleep(wait_time)
 
 class StacAssetCache:
-    def __init__(self, cache_root=r"r:\\dea-local-cache", min_free_space_mb=1000, max_workers=None, read_timeout=600, max_rate_mb=None):
+
+    def __init__(
+        self,
+        cache_root=r"r:\\dea-local-cache",
+        min_free_space_mb=1000,
+        max_workers=None,
+        read_timeout=600,
+        max_rate_mb=None,
+        url_list_capacity=10000,
+    ):
+        # Immediately disable if cache_root is None or empty
+        if not cache_root:
+            self.enabled = False
+            self._executor = None
+            logger.info("StacAssetCache disabled: no cache_root provided.")
+            return
+
         self.cache_root = Path(cache_root)
         self.enabled = True
         try:
             self.cache_root.mkdir(parents=True, exist_ok=True)
             if not os.access(self.cache_root, os.W_OK):
                 raise PermissionError(f"No write access to {self.cache_root}")
+            
+            if min_free_space_mb < 0:
+                logger.warning(f"Invalid min_free_space_mb={min_free_space_mb}, defaulting to 1000")
+                min_free_space_mb = 1000
             self.min_free_space = min_free_space_mb * 1024 * 1024
 
             self._url_map = {}
             self._inflight = {}
             self._lock = threading.Lock()
             self._limiter = RateLimiter(max_rate_mb)
+            
+            if not url_list_capacity > 0:
+                logger.warning(f"Invalid url_list_capacity={url_list_capacity}, defaulting to 10000")
+                url_list_capacity = 10000
+            self._url_list_capacity = url_list_capacity
 
             cpu_count = os.cpu_count() or 4
+            
+            if read_timeout < 0:
+                logger.warning(f"Invalid read_timeout={read_timeout}, defaulting to 600")
+                read_timeout = 600
             self._timeout = (30, read_timeout)
             self.workers = max_workers or min(32, max(4, cpu_count))
             self._executor = ThreadPoolExecutor(max_workers=self.workers)
 
             logger.info(f"StacAssetCache initialized with {self.workers} worker threads")
         except Exception as e:
-            print(f"Warning: local cache unavailable ({e}), falling back to remote only")
+            logger.warning(f"Local cache unavailable ({e}), falling back to remote only")
             self.enabled = False
+            self._executor = None
 
     def _check_disk_space(self, required_bytes=0):
         try:
@@ -76,10 +106,10 @@ class StacAssetCache:
         """
         if "data.dea.ga.gov.au" in url:
             return url.replace("https://data.dea.ga.gov.au/", "dea-public-data/")
-        
+
         if url.startswith("s3://"):
             return url.replace("s3://", "")
-            
+
         return url
 
     def _cleanup_local_stale_tmp(self, dir_path, max_age=86400):
@@ -98,7 +128,7 @@ class StacAssetCache:
         except OSError:
             pass
 
-    def _download_asset(self, url, max_retries=3):
+    def _download_asset(self, url, priority=None, max_retries=3):
         """Download a single asset via HTTPS with atomic write and retries."""
         try:
             s3_path = self._url_to_path(url)
@@ -119,7 +149,7 @@ class StacAssetCache:
             self._cleanup_local_stale_tmp(local_dest.parent)
 
             tmp_dest = local_dest.with_suffix(f".{random.randint(100000, 999999)}.tmp")
-            
+
             # Construct HTTPS URL
             if s3_path.startswith("dea-public-data/"):
                 https_url = f"https://data.dea.ga.gov.au/{s3_path.replace('dea-public-data/', '', 1)}"
@@ -130,8 +160,9 @@ class StacAssetCache:
 
             for attempt in range(max_retries):
                 try:
-                    logger.info(
-                        f"Downloading: {s3_path} (Attempt {attempt + 1}) "
+                    p_str = f" [p={priority}]" if priority is not None else ""
+                    logger.debug(
+                        f"Downloading{p_str}: {s3_path} (Attempt {attempt + 1}) "
                         f"[thread={threading.current_thread().name}]"
                     )
                     t0 = time.time()
@@ -144,18 +175,25 @@ class StacAssetCache:
                         resp.raise_for_status()
                         with open(tmp_dest, "wb") as local_f:
                             for chunk in resp.iter_content(chunk_size=chunk_sz):
+                                if not chunk:
+                                    continue
+
                                 self._limiter.consume(len(chunk))
                                 local_f.write(chunk)
                                 local_f.flush()
                                 os.fsync(local_f.fileno())
+
+                                last_progress = time.time()
+                                if time.time() - last_progress > 60:
+                                    raise TimeoutError("Download stalled")
                     # Atomic rename — no lock needed: tmp name is unique per thread,
                     # and replace() is atomic on NTFS.
                     tmp_dest.replace(local_dest)
 
                     elapsed = time.time() - t0
                     size_mb = local_dest.stat().st_size / (1024 * 1024)
-                    logger.info(
-                        f"Finished: {s3_path} in {elapsed:.2f}s ({size_mb:.1f} MB) "
+                    logger.debug(
+                        f"Finished{p_str}: {s3_path} in {elapsed:.2f}s ({size_mb:.1f} MB) "
                         f"[thread={threading.current_thread().name}]"
                     )
                     return url, str(local_dest.resolve())
@@ -176,41 +214,85 @@ class StacAssetCache:
             logger.error(f"Unexpected error downloading {url}: {e}")
             return url, url
 
-    def _get_intersection_priority(self, item_bbox, filter_bboxes):
+    def _get_intersection_priority(self, item_bbox, filter_bboxes, padding=0.1):
         """
-        Finds index of first intersecting bbox (priority).
-        
+        Finds index of first intersecting bbox (priority).  This puts items in cache in order needed.
+
+
         Iterates through filter_bboxes in order and returns the index of the *first* match.
-        This ensures that if an item intersects multiple bboxes, it is assigned the 
+        This ensures that if an item intersects multiple bboxes, it is assigned the
         priority of the lowest-index bbox (e.g. earliest macro-tile).
-        
+
+        Args:
+            padding (float): Padding in degrees to apply to filter bboxes.
+                             0.1 deg is approx 11km, providing buffer for edge effects.
+
         Returns None if no intersection.
         """
         if not filter_bboxes:
             return 0
-        
+
+        if not item_bbox or len(item_bbox) != 4:
+            return None
+
         ix0, iy0, ix1, iy1 = item_bbox
         for i, (fx0, fy0, fx1, fy1) in enumerate(filter_bboxes):
             # Check for overlap: not (Left > Right or Right < Left or Top < Bottom or Bottom > Top)
-            if ix0 < fx1 and ix1 > fx0 and iy0 < fy1 and iy1 > fy0:
+            if (
+                ix0 < fx1 + padding
+                and ix1 > fx0 - padding
+                and iy0 < fy1 + padding
+                and iy1 > fy0 - padding
+            ):
                 return i
         return None
 
-    def _on_download_done(self, fut):
+    def _prune_url_map(self, num_to_remove=1000):
+        """If _url_map is over capacity, remove the oldest `num_to_remove` items."""
+        # This method should be called within a lock.
+        if len(self._url_map) >= self._url_list_capacity:
+            # In Python 3.7+, dicts are insertion-ordered. list(keys()) gives us oldest first.
+            # We collect keys to remove first to avoid modifying the dict during iteration.
+            keys_to_remove = list(self._url_map.keys())[:num_to_remove]
+            for key in keys_to_remove:
+                self._url_map.pop(key, None)
+            logger.debug(
+                f"Pruned {len(keys_to_remove)} oldest entries from url_map "
+                f"(new size: {len(self._url_map)})"
+            )
+
+    def _on_download_done(self, url, fut):
         try:
-            url, path = fut.result()
+            _, path = fut.result()
         except Exception:
-            return
+            path = url
         with self._lock:
+            self._prune_url_map()
             self._url_map[url] = path
             self._inflight.pop(url, None)
-            
+        logger.debug(f"Download completed: {url} -> {path}")
+
     def _gather_assets(self, items, bands, intersection_filter, seen):
         assets = []
         total_bytes = 0
-        for item in items:
+        
+        if not items:
+            return assets, total_bytes
+
+        try:
+            iterator = iter(items)
+        except TypeError:
+            logger.warning(f"Items argument is not iterable: {type(items)}")
+            return assets, total_bytes
+
+        for item in iterator:
+            if not hasattr(item, "assets"):
+                continue
+
             priority = 0
             if intersection_filter:
+                if not hasattr(item, "bbox"):
+                    continue
                 priority = self._get_intersection_priority(item.bbox, intersection_filter)
                 if priority is None:
                     continue
@@ -238,22 +320,31 @@ class StacAssetCache:
             )
             return
 
-        # Sort downloads by priority (lowest index = earliest macro-tile)
-        # This ensures files needed first are downloaded first
+        # Sort by priority so early macro-tile assets download first
         assets_to_download.sort(key=lambda x: x[0])
 
         logger.info(
             f"Starting {len(assets_to_download)} downloads with {self.workers} workers "
             f"(~{total_expected_bytes / (1024 * 1024):.1f} MB expected)"
         )
+        for i in assets_to_download:
+            logger.debug(f"Priority: {i[0]}, URL: {i[1]}")
 
-        for _, url in assets_to_download:
+        for priority, url in assets_to_download:
             with self._lock:
-                if url in self._inflight or url in self._url_map:
+                # Skip already cached
+                if url in self._url_map:
                     continue
-                fut = self._executor.submit(self._download_asset, url)
-                self._inflight[url] = fut
-                fut.add_done_callback(self._on_download_done)
+                # Skip if already queued or running
+                if url in self._inflight:
+                    continue
+                # Submit download with priority metadata
+                fut = self._executor.submit(self._download_asset, url, priority=priority)
+                self._inflight[url] = (
+                    fut,
+                    priority,
+                )  # store tuple instead of just Future
+                fut.add_done_callback(lambda f, u=url: self._on_download_done(u, f))
 
     def submit_cache_items(self, items, bands=None, intersection_filter=None):
         """
@@ -281,7 +372,7 @@ class StacAssetCache:
         """
         if not self.enabled or not batches:
             return
-
+        
         # Normalize input to list of batches if it looks like a single [items, bands] pair
         if isinstance(batches, (list, tuple)) and len(batches) == 2:
             second = batches[1]
@@ -293,52 +384,69 @@ class StacAssetCache:
             if is_bands:
                 batches = [batches]
 
+        if not isinstance(batches, (list, tuple)):
+            logger.warning(f"submit_batches expected list or tuple, got {type(batches)}")
+            return
+
         seen = set()
         all_assets = []
         total_bytes = 0
 
-        for items, bands in batches:
-            assets, bytes_ = self._gather_assets(items, bands, intersection_filter, seen)
-            all_assets.extend(assets)
-            total_bytes += bytes_
+        for i, batch in enumerate(batches):
+            if not isinstance(batch, (list, tuple)) or len(batch) != 2:
+                logger.warning(f"Skipping invalid batch at index {i}: expected (items, bands)")
+                continue
+            
+            items, bands = batch
+            try:
+                assets, bytes_ = self._gather_assets(items, bands, intersection_filter, seen)
+                all_assets.extend(assets)
+                total_bytes += bytes_
+            except Exception as e:
+                logger.warning(f"Error gathering assets for batch {i}: {e}")
 
         self._submit_assets(all_assets, total_bytes)
 
-    def patch_url(self, url):
-        """
-        Resolve a STAC asset URL to its cached local path.
-        Falls back to a lazy single-file download if not already cached,
-        then returns the original URL if caching is disabled or failed.
-        """
+    def patch_url(self, url, timeout=0.5):
         if not self.enabled:
             return url
 
         with self._lock:
-            if url in self._url_map:
-                return self._url_map[url]
+            # Check memory map first
+            path = self._url_map.get(url)
+            inflight = self._inflight.get(url)
 
-            fut = self._inflight.get(url)
+            # Cached in memory
+            if path and Path(path).exists():
+                logger.debug(f"patch_url HIT in memory: {url} -> {path}")
+                return path
 
-        # If a background download is already happening — WAIT
-        if fut is not None:
-            try:
-                _, path = fut.result()
-            except Exception:
-                path = url
-                
-            with self._lock:
-                self._url_map[url] = path
-                self._inflight.pop(url, None)
-            return path
+            # Check disk cache
+            local_path = self.cache_root / self._url_to_path(url)
+            if local_path.exists() and local_path.stat().st_size > 0:
+                resolved_path = str(local_path.resolve())
+                self._prune_url_map()
+                self._url_map[url] = resolved_path
+                logger.debug(f"patch_url HIT on disk: {url} -> {resolved_path}")
+                return resolved_path
 
-        # Otherwise: true lazy download
-        _, path = self._download_asset(url)
-        with self._lock:
-            self._url_map[url] = path
-        return path
+            # Already inflight: do not submit again
+            if inflight:
+                priority = inflight[1]
+                logger.debug(f"patch_url HIT inflight: {url}, priority={priority}")
+                return url
+
+            # Not cached, not inflight → submit background download
+            fut = self._executor.submit(self._download_asset, url)
+            self._inflight[url] = (fut, None)  # priority unknown here
+            fut.add_done_callback(lambda f, u=url: self._on_download_done(u, f))
+            priority = None
+            logger.debug(f"patch_url MISS and REQUESTED: {url}, priority={priority}")
+
+        return url
 
     @staticmethod
-    def get_static_patcher(cache_root):
+    def patch_url_static(cache_root):
         """
         Returns a lightweight, read-only patch_url function.
         
@@ -347,16 +455,16 @@ class StacAssetCache:
             odc.stac.load(..., patch_url=patcher)
         """
         root = Path(cache_root)
-        
+
         if not root.exists():
             return lambda url: url
-        
+
         def patch(url):
             try:
                 # Use the class's logic to ensure 1:1 compatibility with the writer
                 rel_path = StacAssetCache._url_to_path(url)
                 local_path = root / rel_path
-                
+
                 if local_path.exists():
                     return str(local_path.resolve())
             except Exception:
@@ -373,7 +481,7 @@ class StacAssetCache:
         """Delete .tmp files older than max_age_seconds (default 24h)."""
         if not self.cache_root.exists():
             return
-        
+
         count = 0
         now = time.time()
         for root, _, files in os.walk(self.cache_root):
@@ -447,7 +555,7 @@ class StacAssetCache:
 
         for s in stats:
             p = s["path"]
-            fsize = s["size"]
+            file_size = s["size"]
             mtime = s["mtime"]
 
             if s["lock"]:
@@ -469,7 +577,7 @@ class StacAssetCache:
                 age_buckets[">6mo"] += 1
 
             total_files += 1
-            total_bytes += fsize
+            total_bytes += file_size
 
             # Collection classification by path structure
             rel_path = p.relative_to(self.cache_root)
@@ -485,7 +593,7 @@ class StacAssetCache:
             else:
                 unclassified_files += 1
 
-            collections[col_name] = collections.get(col_name, 0) + fsize
+            collections[col_name] = collections.get(col_name, 0) + file_size
 
         # Print summary
         print(f"\nCache: {total_bytes / (1 << 30):.2f} GB, {total_files} files")
@@ -510,4 +618,5 @@ class StacAssetCache:
 
     def close(self):
         """Shut down the thread pool executor."""
-        self._executor.shutdown(wait=True)
+        if hasattr(self, "_executor") and self._executor:
+            self._executor.shutdown(wait=True)

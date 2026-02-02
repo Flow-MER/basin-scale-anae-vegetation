@@ -91,7 +91,11 @@ def get_cache():
     if _CACHE is None:
         with _CACHE_LOCK:
             if _CACHE is None:
-                _CACHE = StacAssetCache(max_rate_mb=40)
+                if config.USE_CACHE:
+                    _CACHE = StacAssetCache(max_rate_mb=50)
+                else:
+                    # Pass cache_root=None to get a disabled cache object
+                    _CACHE = StacAssetCache(cache_root=None, max_rate_mb=50)
     return _CACHE
 
 
@@ -940,8 +944,6 @@ def main():
                 process_month(year, month, raster_tiles, macro_tiles, catalog)
 
                 # Previous month's files are on disk and won't be looked up again.
-                # Clear the URL map to keep memory bounded over a 40-year run.
-                cache.clear_url_map()
     finally:
         try:
             get_client().close()
