@@ -59,11 +59,13 @@ if str(project_root) not in sys.path:
 
 from tools.logging_setup import setup_logging
 from tools.dask import start_dask
+from tools.caching import StacAssetCache
+import threading
 
 from config import ndvi_landsat_cfg as config
 logger = logging.getLogger(__name__)
 
-#silence noisy warning from rasterio vs lazy loading xarray
+# silence noisy warning from rasterio vs lazy loading xarray
 
 import warnings
 from rasterio.errors import NotGeoreferencedWarning
@@ -79,6 +81,19 @@ warnings.filterwarnings(
 # =========================
 # Global variable on each worker to store the mapping once loaded
 _WORKER_UID_CACHE = None
+
+_CACHE = None
+_CACHE_LOCK = threading.Lock()
+
+
+def get_cache():
+    global _CACHE
+    if _CACHE is None:
+        with _CACHE_LOCK:
+            if _CACHE is None:
+                _CACHE = StacAssetCache(max_rate_mb=40)
+    return _CACHE
+
 
 def get_mapping_on_worker():
     """
@@ -487,16 +502,23 @@ def search_stac_collection(catalog, collections, bbox, start_date, end_date, des
 def load_landsat_macro(items, bbox_wgs84, macro_id, year, month):
     """Loads Landsat data, computes NDVI and clear mask for a macro-tile."""
     logger.debug(f"   Macro-tile {macro_id}: loading landsat data...")
+
+    bands = ["nbart_red", "nbart_nir", "oa_fmask"]
+
+    cache = get_cache()
+    # preload = cache.cache_items(items, bands)
+
     try:
         landsat_ds = odc.stac.load(
             items,
-            bands=["nbart_red", "nbart_nir", "oa_fmask"],
+            bands=bands,
             bbox=bbox_wgs84,
             crs=config.CRS,
             resolution=30,
             groupby="solar_day",
             chunks={"time": 1, "x": config.TILE_PIXELS, "y": config.TILE_PIXELS},
             fail_on_error=False,
+            patch_url=cache.patch_url,
         )
     except Exception as e:
         logger.error(f"Landsat load failed for macro-tile {macro_id}: {e}")
@@ -511,7 +533,9 @@ def load_landsat_macro(items, bbox_wgs84, macro_id, year, month):
         logger.warning(f"      Landsat: no data for macro-tile {macro_id} ({year}-{month:02d})")
         return None, None
 
-    logger.info(f"   Loaded {landsat_ds.time.size}/{len(items)} Landsat scenes for macro-tile {macro_id}")
+    logger.info(
+        f"   Loading {landsat_ds.time.size}/{len(items)} Landsat scenes for macro-tile {macro_id}..."
+    )
 
     landsat_ds = landsat_ds.persist()
     check_dask_graph(landsat_ds, "landsat_ds after persist")
@@ -530,37 +554,43 @@ def load_landsat_macro(items, bbox_wgs84, macro_id, year, month):
     ndvi = compute_ndvi(landsat_ds.nbart_red, landsat_ds.nbart_nir).persist()
     del landsat_ds
     logger.debug(f"      Memory after NDVI compute: {log_memory()}")
-    
     return ndvi, clear_mask
 
 
 def apply_wofs_mask(ndvi, wofs_items, bbox_wgs84, macro_id):
     """Loads WOfS data and masks open water from NDVI."""
     logger.debug(f"   Macro-tile {macro_id}: loading WOfS data and open water mask")
+
+    cache = get_cache()
+
     try:
         wofs_data = odc.stac.load(
             wofs_items,
+            bands=["water"],
             bbox=bbox_wgs84,
             crs=config.CRS,
             resolution=30,
             groupby="solar_day",
             chunks={"time": 1, "x": config.TILE_PIXELS, "y": config.TILE_PIXELS},
             fail_on_error=False,
+            patch_url=cache.patch_url,
         )
         if (
             wofs_data is not None
             and "water" in wofs_data
             and wofs_data.time.size > 0
         ):
-            logger.info(f"   Loaded {wofs_data.time.size}/{len(wofs_items)} WOfS scenes for macro-tile {macro_id}")
+            logger.info(
+                f"   Loading {wofs_data.time.size}/{len(wofs_items)} WOfS scenes for macro-tile {macro_id}..."
+            )
             wofs_data = wofs_data.persist()
             water_int = wofs_data.water.fillna(0).astype("uint8")
             quality_mask = (water_int & 0b01100011) == 0
             open_water = (water_int & (1 << 7)) > 0
             vegetation_mask = ~open_water & quality_mask
-            
+
             ndvi_masked = ndvi.where(vegetation_mask)
-            
+
             masked_pixels = vegetation_mask.sum().compute()
             logger.debug(
                 f"      WOfS applied, {masked_pixels:.0f} open water pixels masked"
@@ -569,7 +599,7 @@ def apply_wofs_mask(ndvi, wofs_items, bbox_wgs84, macro_id):
             return ndvi_masked
     except Exception as e:
         logger.warning(f"WOfS load or masking failed: {e}", exc_info=True)
-    
+
     return ndvi
 
 
@@ -650,12 +680,10 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
     tiles = macro_tile["tiles"]
     bbox_wgs84 = macro_tile["bounds_wgs84"]
 
-    logger.info(f"   Macro-tile {macro_id}: {len(tiles)} sub-tiles")
-
     cache_dir = config.OUTPUT_DIR / "cache" / f"{year}_{month:02d}"
     cached_tiles = []
     uncached_tiles = []
-    
+
     for tile in tiles:
         cache_file = cache_dir / f"tile_{tile['tile_id']:05d}.parquet"
         if cache_file.exists():
@@ -666,17 +694,21 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
                 uncached_tiles.append(tile)
         else:
             uncached_tiles.append(tile)
-    
+
     if not uncached_tiles:
-        logger.info(f"   Macro-tile {macro_id} fully cached")
+        logger.info(f"   Macro-tile {macro_id} fully cached ({len(tiles)} sub-tiles)")
         return cached_tiles
+
+    logger.info(
+        f"   Macro-tile {macro_id}: processing {len(uncached_tiles)}/{len(tiles)} sub-tiles"
+    )
 
     tile_masks = {tile["tile_id"]: load_tile_mask(tile["tile_id"]) for tile in uncached_tiles}
     tile_masks = {k: v for k, v in tile_masks.items() if v is not None}
-    
+
     dask_client = get_client()
     tile_masks_future = dask_client.scatter(tile_masks, broadcast=True)
-    
+
     ndvi, clear_mask = load_landsat_macro(items, bbox_wgs84, macro_id, year, month)
     if ndvi is None:
         return cached_tiles
@@ -723,12 +755,13 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
     return cached_tiles + [r for r in new_results if r is not None]
 
 
-def process_month(year, month, raster_tiles, macro_tiles, dask_client, catalog):
+def process_month(year, month, raster_tiles, macro_tiles, catalog):
     """Process month using macro-region strategy."""
     final_out = config.OUTPUT_DIR / f"NDVI_{year}_{month:02d}.parquet"
     if final_out.exists():
         logger.info(f"  Found saved result {year}-{month:02d} in {final_out.name} - skipping processing")
         return
+
     logger.info(f"Processing {year}-{month:02d}")
 
     all_bounds = [t["bounds"] for t in raster_tiles]
@@ -755,11 +788,37 @@ def process_month(year, month, raster_tiles, macro_tiles, dask_client, catalog):
     if not wofs_items:
         return
 
+    # Pre-cache all Landsat + WOfS assets for this month in one parallel burst.
+    # All macro_tiles draw from this same pool, so preloading here saturates
+    # the connection once rather than doing 16-20 smaller downloads in the loop.
+    cache = get_cache()
+
+    # Calculate WGS84 bboxes ordered by macro-tile processing sequence
+    # This allows the cache to prioritize downloads for the first macro-tiles
+    macro_bboxes = [m["bounds_wgs84"] for m in macro_tiles]
+
+    landsat_bands = ["nbart_red", "nbart_nir", "oa_fmask"]
+
+    # Fire and forget — downloads run in the background while the loop starts
+    # preload_future_landsat = cache._executor.submit(cache.cache_items, items, landsat_bands, tile_bboxes)
+    # preload_future_wofs = cache._executor.submit(cache.cache_items, wofs_items, ["water"], tile_bboxes)
+    # Fire-and-forget — submit from MAIN THREAD
+    cache.submit_batches(
+        [(items, landsat_bands), (wofs_items, ["water"])],
+        intersection_filter=macro_bboxes,
+    )
+
+    # Ensure Dask is running
+    try:
+        dask_client = get_client()
+    except (ValueError, OSError):
+        dask_client = start_dask()
+
     # Gathers results one macro-region at a time
     all_results = []
     for macro_tile in macro_tiles:
         logger.info(f"Macro-tile {macro_tile['macro_id']} - {year}-{month:02d} - memory use: {log_memory()}")
-        
+
         # Retry logic to handle worker crashes (e.g. OOM) or lost scattered data
         max_retries = 3
         for attempt in range(max_retries):
@@ -776,9 +835,11 @@ def process_month(year, month, raster_tiles, macro_tiles, dask_client, catalog):
                 if attempt == max_retries - 1:
                     raise e
                 time.sleep(5)
-        
+
         # FORCE CLEANUP: Tell all workers to clear memory before next macro-tile
         dask_client.run(gc.collect)
+    # preload_future_landsat.result()
+    # preload_future_wofs.result()
 
     if not all_results:
         logger.info(f"  No results for {year}-{month:02d}. Creating empty baseline.")
@@ -821,12 +882,12 @@ def process_month(year, month, raster_tiles, macro_tiles, dask_client, catalog):
 
     final_result["year"] = year
     final_result["month"] = month
-    
+
     final_result = final_result.rename(columns={
         "count_sum": "count",
         "clear_pixels_sum": "clear_pixels"
     })
-    
+
     final_result = final_result.drop(columns=["w_ndvi_sum"])
     try:
         tmp_out = final_out.with_suffix(".tmp.parquet")
@@ -848,10 +909,10 @@ def main():
     """Main execution entry point for Landsat NDVI processing."""
     setup_logging(config.LOG_DIR, "ndvi_processing")
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     raster_tiles = load_or_create_raster_tiles(config.POLYGON_PATH)
     macro_tiles = create_macro_tiles(raster_tiles)
-    
+
     if config.END_DATE is None:
         current_date = datetime.now()
         end_year, end_month = current_date.year, current_date.month - 1
@@ -861,13 +922,14 @@ def main():
     else:
         end_year, end_month = config.END_DATE
     start_year, start_month = config.START_DATE
-        
-    logger.info(f"Processing {start_year}-{start_month:02d} to {end_year}-{end_month:02d}")
-    
 
-    #persistent session
+    logger.info(
+        f"Processing {start_year}-{start_month:02d} to {end_year}-{end_month:02d}"
+    )
+
+    # persistent session
     catalog = stac_client()
-    dask_client = start_dask()
+    cache = get_cache()
     try:
         for year in range(start_year, end_year + 1):
             for month in range(1, 13):
@@ -875,9 +937,17 @@ def main():
                     continue
                 if (year, month) > (end_year, end_month):
                     break
-                process_month(year, month, raster_tiles, macro_tiles, dask_client, catalog)
+                process_month(year, month, raster_tiles, macro_tiles, catalog)
+
+                # Previous month's files are on disk and won't be looked up again.
+                # Clear the URL map to keep memory bounded over a 40-year run.
+                cache.clear_url_map()
     finally:
-        dask_client.close()
+        try:
+            get_client().close()
+            cache.close()
+        except (ValueError, OSError):
+            pass
 
 
 if __name__ == "__main__":

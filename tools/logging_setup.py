@@ -21,7 +21,7 @@ def setup_logging(log_dir, script_name, file_level=logging.DEBUG, console_level=
     """
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"{script_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file = log_dir / f"{script_name}_{datetime.now().strftime('%Y%m%d')}.log"
     
     # Root logger configuration
     root_logger = logging.getLogger()
