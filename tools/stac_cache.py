@@ -1,3 +1,15 @@
+"""
+STAC Asset Caching Module
+=========================
+
+Provides a thread-safe, persistent local cache for STAC assets (e.g., GeoTIFFs) fetched from remote URLs.
+
+Key Features:
+- **Atomic Writes**: Uses temporary files and atomic renames to ensure partial downloads are never read.
+- **Rate Limiting**: Global token bucket limiter to prevent saturating network bandwidth.
+- **Prioritization**: Downloads can be prioritized (e.g., based on spatial location) to optimize processing pipelines.
+- **Resilience**: Handles network retries and falls back to remote URLs if caching fails.
+"""
 import os
 import time
 import random
@@ -13,14 +25,26 @@ logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
-    """Thread-safe token bucket for global bandwidth throttling."""
+    """
+    Thread-safe token bucket for global bandwidth throttling.
+    
+    Ensures that the aggregate download rate across all threads does not exceed
+    the specified limit.
+    """
     def __init__(self, max_rate_mb):
+        """
+        Args:
+            max_rate_mb (float): Maximum allowed speed in Megabytes per second.
+        """
         self.rate_per_sec = max_rate_mb * 1024 * 1024 if max_rate_mb else 0
         self.tokens = self.rate_per_sec
         self.last_check = time.time()
         self._lock = threading.Lock()
 
     def consume(self, amount):
+        """
+        Consumes tokens for the given byte amount. Blocks (sleeps) if insufficient tokens.
+        """
         if self.rate_per_sec <= 0:
             return
         with self._lock:
@@ -35,8 +59,18 @@ class RateLimiter:
         if wait_time > 0:
             time.sleep(wait_time)
 
-class StacAssetCache:
-
+class STACCache:
+    """
+    Manages local caching of remote STAC assets.
+    
+    This class handles:
+    1.  Mapping remote URLs to local file paths.
+    2.  Downloading files in the background using a thread pool.
+    3.  Managing disk space and cleaning up stale temporary files.
+    4.  Providing a `patch_url` method compatible with `odc.stac.load`.
+    
+    The cache is persistent across runs if the `cache_root` remains the same.
+    """
     def __init__(
         self,
         cache_root=r"r:\\dea-local-cache",
@@ -45,16 +79,28 @@ class StacAssetCache:
         read_timeout=600,
         max_rate_mb=None,
         url_list_capacity=10000,
+        readonly = False,
     ):
+        """
+        Args:
+            cache_root (str): Local directory to store cached files.
+            min_free_space_mb (int): Minimum free disk space (MB) required to continue downloading.
+            max_workers (int): Number of download threads. Defaults to CPU count based heuristic.
+            read_timeout (int): Timeout in seconds for read operations.
+            max_rate_mb (float): Global bandwidth limit in MB/s.
+            url_list_capacity (int): Max number of URL mappings to keep in memory (LRU).
+        """
         # Immediately disable if cache_root is None or empty
         if not cache_root:
             self.enabled = False
             self._executor = None
-            logger.info("StacAssetCache disabled: no cache_root provided.")
+            logger.info("STACCache disabled: no cache_root provided.")
             return
 
         self.cache_root = Path(cache_root)
         self.enabled = True
+        self.readonly = True if readonly else False
+
         try:
             self.cache_root.mkdir(parents=True, exist_ok=True)
             if not os.access(self.cache_root, os.W_OK):
@@ -64,6 +110,8 @@ class StacAssetCache:
                 logger.warning(f"Invalid min_free_space_mb={min_free_space_mb}, defaulting to 1000")
                 min_free_space_mb = 1000
             self.min_free_space = min_free_space_mb * 1024 * 1024
+            self.enabled = self._check_disk_space(self.min_free_space)
+                
 
             self._url_map = {}
             self._inflight = {}
@@ -81,16 +129,17 @@ class StacAssetCache:
                 logger.warning(f"Invalid read_timeout={read_timeout}, defaulting to 600")
                 read_timeout = 600
             self._timeout = (30, read_timeout)
-            self.workers = max_workers or min(32, max(4, cpu_count))
+            self.workers = max_workers or min(16, max(4, cpu_count))
             self._executor = ThreadPoolExecutor(max_workers=self.workers)
 
-            logger.info(f"StacAssetCache initialized with {self.workers} worker threads")
+            logger.info(f"STACCache initialized with {self.workers} worker threads")
         except Exception as e:
             logger.warning(f"Local cache unavailable ({e}), falling back to remote only")
             self.enabled = False
             self._executor = None
 
     def _check_disk_space(self, required_bytes=0):
+        """Verifies sufficient disk space is available before starting a download."""
         try:
             _, _, free = shutil.disk_usage(str(self.cache_root))
             return free >= self.min_free_space + required_bytes
@@ -113,7 +162,16 @@ class StacAssetCache:
         return url
 
     def _cleanup_local_stale_tmp(self, dir_path, max_age=86400):
-        """Opportunistically clean stale .tmp files in a specific directory."""
+        """
+        Opportunistically clean stale .tmp files in a specific directory.
+
+        Why this approach?
+        - It is called after a successful download completes for a specific directory.
+        - This is more efficient than a global, periodic scan, especially when the
+          cache has a deep, sparse directory structure.
+        - The I/O cost of scanning a single, small directory is negligible and is
+          amortized across successful downloads.
+        """
         try:
             now = time.time()
             # os.scandir is faster than Path.glob as it avoids creating Path objects
@@ -129,7 +187,14 @@ class StacAssetCache:
             pass
 
     def _download_asset(self, url, priority=None, max_retries=3):
-        """Download a single asset via HTTPS with atomic write and retries."""
+        """
+        Download a single asset via HTTPS with atomic write and retries.
+        
+        Why Atomic Write?
+        We download to a .tmp file and then `os.replace` (rename) it to the final filename.
+        This ensures that other processes or threads never see a partially downloaded file.
+        If the process crashes mid-download, only a .tmp file is left, which is cleaned up later.
+        """
         try:
             s3_path = self._url_to_path(url)
             local_dest = self.cache_root / Path(s3_path)
@@ -143,10 +208,8 @@ class StacAssetCache:
             # Disk space check
             if not self._check_disk_space():
                 logger.warning(f"Skipping cache, low disk space for {s3_path}")
+                self.enabled = False
                 return url, url
-
-            # Self-cleaning: remove stale .tmp files in this specific directory
-            self._cleanup_local_stale_tmp(local_dest.parent)
 
             tmp_dest = local_dest.with_suffix(f".{random.randint(100000, 999999)}.tmp")
 
@@ -180,15 +243,12 @@ class StacAssetCache:
 
                                 self._limiter.consume(len(chunk))
                                 local_f.write(chunk)
-                                local_f.flush()
-                                os.fsync(local_f.fileno())
 
-                                last_progress = time.time()
-                                if time.time() - last_progress > 60:
-                                    raise TimeoutError("Download stalled")
                     # Atomic rename — no lock needed: tmp name is unique per thread,
                     # and replace() is atomic on NTFS.
                     tmp_dest.replace(local_dest)
+                    # Self-cleaning: remove stale .tmp files in this specific directory
+                    self._cleanup_local_stale_tmp(local_dest.parent)
 
                     elapsed = time.time() - t0
                     size_mb = local_dest.stat().st_size / (1024 * 1024)
@@ -214,18 +274,22 @@ class StacAssetCache:
             logger.error(f"Unexpected error downloading {url}: {e}")
             return url, url
 
-    def _get_intersection_priority(self, item_bbox, filter_bboxes, padding=0.1):
+    def _get_intersection_priority(self, item_bbox, filter_bboxes, padding=0.2):
         """
-        Finds index of first intersecting bbox (priority).  This puts items in cache in order needed.
-
-
-        Iterates through filter_bboxes in order and returns the index of the *first* match.
+        Calculates download priority based on spatial intersection.
+        
+        Why?
+        Processing often happens sequentially (e.g., Macro-tile 1, then 2).
+        We want to prioritize downloading assets for Macro-tile 1 so they are ready
+        when the processor needs them, rather than downloading random tiles.
+        
+        Returns the index of the *first* matching bbox in `filter_bboxes`.
         This ensures that if an item intersects multiple bboxes, it is assigned the
         priority of the lowest-index bbox (e.g. earliest macro-tile).
 
         Args:
             padding (float): Padding in degrees to apply to filter bboxes.
-                             0.1 deg is approx 11km, providing buffer for edge effects.
+                             0.2 deg is approx km, providing buffer for edge effects.
 
         Returns None if no intersection.
         """
@@ -248,7 +312,11 @@ class StacAssetCache:
         return None
 
     def _prune_url_map(self, num_to_remove=1000):
-        """If _url_map is over capacity, remove the oldest `num_to_remove` items."""
+        """
+        Enforces LRU (Least Recently Used) capacity on the internal URL map.
+        
+        If _url_map is over capacity, removes the oldest items (Python 3.7+ dicts preserve insertion order).
+        """
         # This method should be called within a lock.
         if len(self._url_map) >= self._url_list_capacity:
             # In Python 3.7+, dicts are insertion-ordered. list(keys()) gives us oldest first.
@@ -322,10 +390,11 @@ class StacAssetCache:
 
         # Sort by priority so early macro-tile assets download first
         assets_to_download.sort(key=lambda x: x[0])
+        
+        total_expected = f" (~{total_expected_bytes / (1024 * 1024):.1f} MB expected)" if total_expected_bytes > 0 else ""
 
         logger.info(
-            f"Starting {len(assets_to_download)} downloads with {self.workers} workers "
-            f"(~{total_expected_bytes / (1024 * 1024):.1f} MB expected)"
+            f"Starting {len(assets_to_download)} downloads with {self.workers} workers{total_expected}"
         )
         for i in assets_to_download:
             logger.debug(f"Priority: {i[0]}, URL: {i[1]}")
@@ -355,7 +424,27 @@ class StacAssetCache:
             bands: List of band/asset keys to cache. If None, caches all assets.
             intersection_filter: List of [minx, miny, maxx, maxy] bboxes. If provided, only items intersecting at least one bbox are cached.
         """
+        # --- Guard clauses for pre-caching ---
+        # Why: Exit early if the cache is not in a state to perform write operations.
         if not self.enabled:
+            logger.debug("Cache is disabled; skipping pre-cache.")
+            return
+        if self.readonly:
+            logger.debug("Cache is in read-only mode; skipping pre-cache.")
+            return
+
+        # Why: Validate that `items` is a non-empty list or tuple before proceeding.
+        if not hasattr(items, "__iter__"):
+            logger.warning(f"Invalid 'items' type for caching. Expected iterable, got {type(items)}.")
+            return
+        if not items:
+            logger.debug("No items provided to cache.")
+            return
+
+        # Why: Validate that `bands` is not an empty list. `None` is a valid input
+        # which means "all bands", so we should not exit if `bands` is None.
+        if isinstance(bands, (list, tuple)) and not bands:
+            logger.debug("Empty 'bands' list provided; nothing to cache.")
             return
 
         seen = set()
@@ -370,7 +459,14 @@ class StacAssetCache:
             batches: List of (items, bands) tuples, or a single [items, bands] list.
             intersection_filter: List of [minx, miny, maxx, maxy] bboxes.
         """
-        if not self.enabled or not batches:
+        if not self.enabled:
+            logger.debug("STAC cache disabled")
+            return
+        elif self.readonly:
+            logger.debug("STAC cache read-only")
+            return
+        elif not batches:
+            logger.debug("No batches to submit")    
             return
         
         # Normalize input to list of batches if it looks like a single [items, bands] pair
@@ -407,15 +503,26 @@ class StacAssetCache:
 
         self._submit_assets(all_assets, total_bytes)
 
-    def patch_url(self, url, timeout=0.5):
+    def patch_url(self, url, timeout=3):
+        """
+        Resolves a remote URL to a local file path if cached.
+        
+        This method is designed to be passed to `odc.stac.load(..., patch_url=cache.patch_url)`.
+        
+        Logic:
+        1. If cached (memory or disk), return local path.
+        2. If downloading (inflight), wait briefly (`timeout`) for it to finish.
+        3. If not cached, trigger a background download and return the ORIGINAL url.
+           This allows the caller (odc.stac) to proceed with a remote read immediately
+           while we cache it for next time.
+        """
         if not self.enabled:
             return url
 
         with self._lock:
             # Check memory map first
             path = self._url_map.get(url)
-            inflight = self._inflight.get(url)
-
+            
             # Cached in memory
             if path and Path(path).exists():
                 logger.debug(f"patch_url HIT in memory: {url} -> {path}")
@@ -430,18 +537,32 @@ class StacAssetCache:
                 logger.debug(f"patch_url HIT on disk: {url} -> {resolved_path}")
                 return resolved_path
 
+            if self.readonly:
+                return url
+
+            inflight = self._inflight.get(url)
             # Already inflight: do not submit again
             if inflight:
                 priority = inflight[1]
                 logger.debug(f"patch_url HIT inflight: {url}, priority={priority}")
-                return url
-
-            # Not cached, not inflight → submit background download
-            fut = self._executor.submit(self._download_asset, url)
-            self._inflight[url] = (fut, None)  # priority unknown here
-            fut.add_done_callback(lambda f, u=url: self._on_download_done(u, f))
-            priority = None
-            logger.debug(f"patch_url MISS and REQUESTED: {url}, priority={priority}")
+            else:
+                # Not cached, not inflight → submit background download
+                fut = self._executor.submit(self._download_asset, url)
+                self._inflight[url] = (fut, None)  # priority unknown here
+                fut.add_done_callback(lambda f, u=url: self._on_download_done(u, f))
+                priority = None
+                logger.debug(f"patch_url MISS and REQUESTED: {url}, priority={priority}")
+        
+        # Short sleep outside lock to allow in-flight download to potentially complete.
+        # This avoids falling back to remote read immediately if the file is just about to finish.
+        time.sleep(timeout)
+        logger.debug(f"patch_url waited {timeout}s for {url}")
+        with self._lock:
+            # Check memory map see if now complete
+            path = self._url_map.get(url)
+            if path and Path(path).exists():
+                logger.debug(f"patch_url HIT in memory after wait: {url} -> {path}")
+                return path
 
         return url
 
@@ -451,7 +572,7 @@ class StacAssetCache:
         Returns a lightweight, read-only patch_url function.
         
         Usage:
-            patcher = StacAssetCache.get_static_patcher(r"r:\\dea-local-cache")
+            patcher = STACCache.get_static_patcher(r"r:\\dea-local-cache")
             odc.stac.load(..., patch_url=patcher)
         """
         root = Path(cache_root)
@@ -462,7 +583,7 @@ class StacAssetCache:
         def patch(url):
             try:
                 # Use the class's logic to ensure 1:1 compatibility with the writer
-                rel_path = StacAssetCache._url_to_path(url)
+                rel_path = STACCache._url_to_path(url)
                 local_path = root / rel_path
 
                 if local_path.exists():
@@ -473,7 +594,7 @@ class StacAssetCache:
         return patch
 
     def clear_url_map(self):
-        """Clears the internal URL map to free memory."""
+        """Clears the internal URL map to free memory. Does not delete files on disk."""
         with self._lock:
             self._url_map.clear()
 

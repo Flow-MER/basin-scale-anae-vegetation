@@ -59,7 +59,7 @@ if str(project_root) not in sys.path:
 
 from tools.logging_setup import setup_logging
 from tools.dask import start_dask
-from tools.caching import StacAssetCache
+from tools.stac_cache import STACCache
 import threading
 
 from config import ndvi_landsat_cfg as config
@@ -92,10 +92,10 @@ def get_cache():
         with _CACHE_LOCK:
             if _CACHE is None:
                 if config.USE_CACHE:
-                    _CACHE = StacAssetCache(max_rate_mb=50)
+                    _CACHE = STACCache(max_rate_mb=40)
                 else:
                     # Pass cache_root=None to get a disabled cache object
-                    _CACHE = StacAssetCache(cache_root=None, max_rate_mb=50)
+                    _CACHE = STACCache(cache_root=None, max_rate_mb=40)
     return _CACHE
 
 
