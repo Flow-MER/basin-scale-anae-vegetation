@@ -45,6 +45,7 @@ import time
 from tqdm import tqdm
 from dask import delayed, compute as dask_compute
 from dask.distributed import Future, get_client
+import threading
 
 import sys
 # Add project root to sys.path to allow imports from config.py and tools/
@@ -59,8 +60,10 @@ if str(project_root) not in sys.path:
 
 from tools.logging_setup import setup_logging
 from tools.dask import start_dask
-from tools.stac_cache import STACCache
-import threading
+try:
+    from tools.stac_cache import STACCache
+except ImportError:
+    STACCache = None
 
 from config import ndvi_landsat_cfg as config
 logger = logging.getLogger(__name__)
@@ -81,22 +84,6 @@ warnings.filterwarnings(
 # =========================
 # Global variable on each worker to store the mapping once loaded
 _WORKER_UID_CACHE = None
-
-_CACHE = None
-_CACHE_LOCK = threading.Lock()
-
-
-def get_cache():
-    global _CACHE
-    if _CACHE is None:
-        with _CACHE_LOCK:
-            if _CACHE is None:
-                if config.USE_CACHE:
-                    _CACHE = STACCache(max_rate_mb=40)
-                else:
-                    # Pass cache_root=None to get a disabled cache object
-                    _CACHE = STACCache(cache_root=None, max_rate_mb=40)
-    return _CACHE
 
 
 def get_mapping_on_worker():
@@ -508,10 +495,9 @@ def load_landsat_macro(items, bbox_wgs84, macro_id, year, month):
     logger.debug(f"   Macro-tile {macro_id}: loading landsat data...")
 
     bands = ["nbart_red", "nbart_nir", "oa_fmask"]
-
-    cache = get_cache()
-    # preload = cache.cache_items(items, bands)
-
+    
+    patch_url = STACCache.get_instance().patch_url if STACCache else None
+    
     try:
         landsat_ds = odc.stac.load(
             items,
@@ -522,7 +508,7 @@ def load_landsat_macro(items, bbox_wgs84, macro_id, year, month):
             groupby="solar_day",
             chunks={"time": 1, "x": config.TILE_PIXELS, "y": config.TILE_PIXELS},
             fail_on_error=False,
-            patch_url=cache.patch_url,
+            patch_url=patch_url,
         )
     except Exception as e:
         logger.error(f"Landsat load failed for macro-tile {macro_id}: {e}")
@@ -565,7 +551,7 @@ def apply_wofs_mask(ndvi, wofs_items, bbox_wgs84, macro_id):
     """Loads WOfS data and masks open water from NDVI."""
     logger.debug(f"   Macro-tile {macro_id}: loading WOfS data and open water mask")
 
-    cache = get_cache()
+    patch_url = STACCache.get_instance().patch_url if STACCache else None
 
     try:
         wofs_data = odc.stac.load(
@@ -577,7 +563,7 @@ def apply_wofs_mask(ndvi, wofs_items, bbox_wgs84, macro_id):
             groupby="solar_day",
             chunks={"time": 1, "x": config.TILE_PIXELS, "y": config.TILE_PIXELS},
             fail_on_error=False,
-            patch_url=cache.patch_url,
+            patch_url=patch_url,
         )
         if (
             wofs_data is not None
@@ -795,7 +781,6 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
     # Pre-cache all Landsat + WOfS assets for this month in one parallel burst.
     # All macro_tiles draw from this same pool, so preloading here saturates
     # the connection once rather than doing 16-20 smaller downloads in the loop.
-    cache = get_cache()
 
     # Calculate WGS84 bboxes ordered by macro-tile processing sequence
     # This allows the cache to prioritize downloads for the first macro-tiles
@@ -807,10 +792,12 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
     # preload_future_landsat = cache._executor.submit(cache.cache_items, items, landsat_bands, tile_bboxes)
     # preload_future_wofs = cache._executor.submit(cache.cache_items, wofs_items, ["water"], tile_bboxes)
     # Fire-and-forget — submit from MAIN THREAD
-    cache.submit_batches(
-        [(items, landsat_bands), (wofs_items, ["water"])],
-        intersection_filter=macro_bboxes,
-    )
+    if STACCache:
+        cache = STACCache.get_instance(patch_url_delay=3, max_rate_mb=40)
+        cache.submit_batches(
+            [(items, landsat_bands), (wofs_items, ["water"])],
+            intersection_filter=macro_bboxes,
+        )
 
     # Ensure Dask is running
     try:
@@ -933,7 +920,6 @@ def main():
 
     # persistent session
     catalog = stac_client()
-    cache = get_cache()
     try:
         for year in range(start_year, end_year + 1):
             for month in range(1, 13):
@@ -947,7 +933,8 @@ def main():
     finally:
         try:
             get_client().close()
-            cache.close()
+            if STACCache:
+                STACCache.get_instance().close()
         except (ValueError, OSError):
             pass
 

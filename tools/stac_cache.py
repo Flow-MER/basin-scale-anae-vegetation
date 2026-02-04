@@ -18,6 +18,7 @@ import logging
 import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import OrderedDict
 
 import requests
 
@@ -71,6 +72,10 @@ class STACCache:
     
     The cache is persistent across runs if the `cache_root` remains the same.
     """
+    _instance = None
+    _lock = threading.Lock()
+    
+    
     def __init__(
         self,
         cache_root=r"r:\\dea-local-cache",
@@ -79,6 +84,8 @@ class STACCache:
         read_timeout=600,
         max_rate_mb=None,
         url_list_capacity=10000,
+        patch_url_delay=0.1,
+        enabled=True,
         readonly = False,
     ):
         """
@@ -91,7 +98,7 @@ class STACCache:
             url_list_capacity (int): Max number of URL mappings to keep in memory (LRU).
         """
         # Immediately disable if cache_root is None or empty
-        if not cache_root:
+        if not enabled:
             self.enabled = False
             self._executor = None
             logger.info("STACCache disabled: no cache_root provided.")
@@ -113,11 +120,16 @@ class STACCache:
             self.enabled = self._check_disk_space(self.min_free_space)
                 
 
-            self._url_map = {}
+            self._url_map = OrderedDict()
             self._inflight = {}
             self._lock = threading.Lock()
             self._limiter = RateLimiter(max_rate_mb)
             
+            if not patch_url_delay >= 0 and patch_url_delay < 5:
+                logger.warning(f"Invalid url_list_patch_url_delay={patch_url_delay}, must be >=0 amd <5, defaulting to 0.1")
+                patch_url_delay = 0.1
+            self.patch_url_delay = patch_url_delay
+          
             if not url_list_capacity > 0:
                 logger.warning(f"Invalid url_list_capacity={url_list_capacity}, defaulting to 10000")
                 url_list_capacity = 10000
@@ -137,6 +149,26 @@ class STACCache:
             logger.warning(f"Local cache unavailable ({e}), falling back to remote only")
             self.enabled = False
             self._executor = None
+            
+
+    @classmethod
+    def get_instance(cls, **kwargs):
+        """Singleton accessor for the STACCache instance."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls(**kwargs)
+        return cls._instance
+            
+            
+    def __enter__(self):
+        """Support 'with STACCache() as cache:' syntax."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Ensure clean shutdown on context exit."""
+        self.close()
+        return False  # Don't suppress exceptions
 
     def _check_disk_space(self, required_bytes=0):
         """Verifies sufficient disk space is available before starting a download."""
@@ -335,10 +367,30 @@ class STACCache:
         except Exception:
             path = url
         with self._lock:
-            self._prune_url_map()
-            self._url_map[url] = path
-            self._inflight.pop(url, None)
+            # Simple FIFO eviction (fast, no I/O)
+            while len(self._url_map) >= self._url_list_capacity:
+                self._url_map.popitem(last=False)  # Remove oldest entry
+            
+            # Add new entry
+            self._url_map[url] = str(path)
+            
+            # Move to end to mark as recently used (optional, for true LRU)
+            self._url_map.move_to_end(url)
+            
+            # Remove from inflight tracking
+            if url in self._inflight:
+                del self._inflight[url]
         logger.debug(f"Download completed: {url} -> {path}")
+    
+    def _safe_callback(self, url, future):
+        """Wrapper to catch exceptions in download callbacks."""
+        try:
+            self._on_download_done(url, future)
+        except Exception as e:
+            logger.error(f"Callback error for {url}: {e}", exc_info=True)
+            # Remove from inflight on error
+            with self._lock:
+                self._inflight.pop(url, None)
 
     def _gather_assets(self, items, bands, intersection_filter, seen):
         assets = []
@@ -413,7 +465,7 @@ class STACCache:
                     fut,
                     priority,
                 )  # store tuple instead of just Future
-                fut.add_done_callback(lambda f, u=url: self._on_download_done(u, f))
+                fut.add_done_callback(lambda f, u=url: self._safe_callback(u, f))
 
     def submit_cache_items(self, items, bands=None, intersection_filter=None):
         """
@@ -549,14 +601,14 @@ class STACCache:
                 # Not cached, not inflight → submit background download
                 fut = self._executor.submit(self._download_asset, url)
                 self._inflight[url] = (fut, None)  # priority unknown here
-                fut.add_done_callback(lambda f, u=url: self._on_download_done(u, f))
+                fut.add_done_callback(lambda f, u=url: self._safe_callback(u, f))
                 priority = None
                 logger.debug(f"patch_url MISS and REQUESTED: {url}, priority={priority}")
         
         # Short sleep outside lock to allow in-flight download to potentially complete.
         # This avoids falling back to remote read immediately if the file is just about to finish.
-        time.sleep(timeout)
-        logger.debug(f"patch_url waited {timeout}s for {url}")
+        time.sleep(self.patch_url_delay)
+        logger.debug(f"patch_url waited {self.patch_url_delay}s for {url}")
         with self._lock:
             # Check memory map see if now complete
             path = self._url_map.get(url)
@@ -657,6 +709,23 @@ class STACCache:
                 }
             except OSError:
                 return None
+            
+        if self._executor and not self._executor._shutdown:
+            # Use parallel processing
+            stats = []
+            futures = {self._executor.submit(stat_worker, f): f for f in all_files}
+            for fut in as_completed(futures):
+                res = fut.result()
+                if res:
+                    stats.append(res)
+        else:
+            # Serial fallback if executor shut down
+            stats = []
+            for f in all_files:
+                res = stat_worker(f)
+                if res:
+                    stats.append(res)  
+            
 
         stats = []
         futures = {self._executor.submit(stat_worker, f): f for f in all_files}

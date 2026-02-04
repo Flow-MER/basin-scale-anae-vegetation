@@ -42,7 +42,6 @@ class NDVILandsatConfig(BaseConfig):
     START_DATE: tuple = (1988, 1)
     END_DATE: tuple | None = None
     WOFS_FILTER_MASK: int = 0b01100011
-    DASK_DASHBOARD_PORT: int = 8787
     MAX_DASK_TASKS: int = 50000
     MAX_DASK_PARTITIONS: int = 500
 
