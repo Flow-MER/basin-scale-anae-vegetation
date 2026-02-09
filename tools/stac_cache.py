@@ -19,6 +19,9 @@ import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
+from dotenv import load_dotenv, find_dotenv
+
+load_dotenv()
 
 import requests
 
@@ -74,11 +77,17 @@ class STACCache:
     """
     _instance = None
     _lock = threading.Lock()
+    # NEW: Hardcoded defaults (works out of the box)
+    DEFAULT_CACHE_ROOT = r"t:\dea-local-cache"
+    DEFAULT_MASTER = r"r:\dea-master-cache"
+    DEFAULT_ARCHIVE = r"r:\dea-archive"
     
     
     def __init__(
         self,
-        cache_root=r"r:\\dea-local-cache",
+        cache_root=r"r:\\dea-archive",
+        fallback_cache=None,
+        copy_up=False,
         min_free_space_mb=1000,
         max_workers=None,
         read_timeout=600,
@@ -107,6 +116,9 @@ class STACCache:
         self.cache_root = Path(cache_root)
         self.enabled = True
         self.readonly = True if readonly else False
+        
+        self.fallback_cache = fallback_cache
+        self.copy_up = copy_up
 
         try:
             self.cache_root.mkdir(parents=True, exist_ok=True)
@@ -124,7 +136,7 @@ class STACCache:
             self._inflight = {}
             self._lock = threading.Lock()
             self._limiter = RateLimiter(max_rate_mb)
-            
+            patch_url_delay = patch_url_delay or os.getenv('PATCH_URL_DELAY') or 0.1
             if not patch_url_delay >= 0 and patch_url_delay < 5:
                 logger.warning(f"Invalid url_list_patch_url_delay={patch_url_delay}, must be >=0 amd <5, defaulting to 0.1")
                 patch_url_delay = 0.1
@@ -144,21 +156,86 @@ class STACCache:
             self.workers = max_workers or min(16, max(4, cpu_count))
             self._executor = ThreadPoolExecutor(max_workers=self.workers)
 
-            logger.info(f"STACCache initialized with {self.workers} worker threads")
+            logger.info(f"STACCache initialized at {self.cache_root} with {self.workers} worker threads")
         except Exception as e:
             logger.warning(f"Local cache unavailable ({e}), falling back to remote only")
             self.enabled = False
             self._executor = None
             
-
     @classmethod
     def get_instance(cls, **kwargs):
-        """Singleton accessor for the STACCache instance."""
+        """
+        Singleton with smart defaults and env var overrides.
+        
+        Default behavior:
+        - Primary: r:\dea-local-cache
+        - Fallback: r:\dea-master-cache → e:\dea-archive
+        
+        Environment variables (override defaults):
+        - STAC_CACHE_ROOT: Primary cache
+        - STAC_CACHE_MASTER: Master fallback
+        - STAC_CACHE_FALLBACKS: Multiple fallbacks (colon-separated)
+        - STAC_CACHE_COPY_UP: Enable copy-up (1/0)
+        
+        Keyword arguments (highest priority):
+        - Any parameter to override
+        
+        Priority: kwargs > env vars > hardcoded defaults
+        """
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    cls._instance = cls(**kwargs)
+                    config = cls._build_config(**kwargs)
+                    cls._instance = cls(**config)
         return cls._instance
+    
+    @classmethod
+    def _build_config(cls, **kwargs):
+        """Build configuration from defaults, env vars, and kwargs."""
+        config = {}
+        
+       
+        # Build default fallback chain
+        
+        master = None
+       
+        config['fallback_cache'] = master
+        config['copy_up'] = False
+        
+        # 2. Environment variables (medium priority)
+        if os.getenv('STAC_CACHE_ROOT'):
+            config['cache_root'] = os.getenv('STAC_CACHE_ROOT')
+        
+        env_master = os.getenv('STAC_CACHE_MASTER')
+        env_fallbacks = os.getenv('STAC_CACHE_FALLBACKS')
+        
+        if env_fallbacks:
+            # Build chain from env
+            fallback_paths = env_fallbacks.split(',')
+            fallback_chain = None
+            for path in reversed(fallback_paths):
+                if Path(path).exists():
+                    fallback_chain = cls(
+                        cache_root=path,
+                        readonly=True,
+                        enabled=True,
+                        fallback_cache=fallback_chain
+                    )
+            config['fallback_cache'] = fallback_chain
+        elif env_master and Path(env_master).exists():
+            config['fallback_cache'] = cls(
+                cache_root=env_master,
+                readonly=True,
+                enabled=True
+            )
+        
+        if os.getenv('STAC_CACHE_COPY_UP') == '1':
+            config['copy_up'] = True
+        
+        # 3. Keyword arguments (highest priority)
+        config.update(kwargs)
+        
+        return config
             
             
     def __enter__(self):
@@ -169,6 +246,13 @@ class STACCache:
         """Ensure clean shutdown on context exit."""
         self.close()
         return False  # Don't suppress exceptions
+    
+    def _check_fallback(self, url):
+        """Check if URL exists in fallback cache."""
+        if not self.fallback_cache:
+            return None
+        fallback_result = self.fallback_cache.patch_url(url)
+        return fallback_result if fallback_result != url else None
 
     def _check_disk_space(self, required_bytes=0):
         """Verifies sufficient disk space is available before starting a download."""
@@ -588,7 +672,14 @@ class STACCache:
                 self._url_map[url] = resolved_path
                 logger.debug(f"patch_url HIT on disk: {url} -> {resolved_path}")
                 return resolved_path
+            
+            fallback_path = self._check_fallback(url)
+            if fallback_path:
+                self._url_map[url] = fallback_path
+                return fallback_path  # or copy it if self.copy_up
 
+            # didn't find the UL in the cache or fallback
+            
             if self.readonly:
                 return url
 
