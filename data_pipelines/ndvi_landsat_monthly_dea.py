@@ -60,16 +60,25 @@ if str(project_root) not in sys.path:
 
 from tools.logging_setup import setup_logging
 from tools.dask import start_dask
+
+###################################################
+# STACCache is authors internal infrastructure
+# this handles other environments
 try:
     from tools.stac_cache import STACCache
 except ImportError:
     STACCache = None
+def _noop_decorator(func):
+    return func
+
+_instance = STACCache.get_instance() if STACCache else None
+cache_search = _instance.cache_search if _instance else _noop_decorator
+###################################################
 
 from config import ndvi_landsat_cfg as config
 logger = logging.getLogger(__name__)
 
-# silence noisy warning from rasterio vs lazy loading xarray
-
+# silence noisy warning from rasterio during dask startup
 import warnings
 from rasterio.errors import NotGeoreferencedWarning
 
@@ -78,6 +87,15 @@ warnings.filterwarnings(
     message="Dataset has no geotransform",
     category=NotGeoreferencedWarning
 )  
+
+# =========================
+# PATH MANAGEMENT
+# =========================
+def get_tiles_dir():
+    return config.OUTPUT_DIR / "tile_masks"
+
+def get_mapping_file():
+    return get_tiles_dir() / "uid_mapping.json"
 
 # =========================
 # SPATIAL GRID
@@ -92,7 +110,7 @@ def get_mapping_on_worker():
     """
     global _WORKER_UID_CACHE
     if _WORKER_UID_CACHE is None:
-        mapping_file = Path(config.OUTPUT_DIR).resolve() / "uid_mapping.json"
+        mapping_file = get_mapping_file().resolve()
         
         try:
             with open(mapping_file) as f:
@@ -106,7 +124,7 @@ def get_mapping_on_worker():
 
 def get_global_uid_mapping():
     """Load existing UID mapping. Must be created during rasterization."""
-    mapping_file = config.OUTPUT_DIR / "uid_mapping.json"
+    mapping_file = get_mapping_file()
     if not mapping_file.exists():
         raise RuntimeError(
             f"UID mapping file {mapping_file} does not exist. "
@@ -152,7 +170,7 @@ def rasterize_tile_polygons(tile_id, tile_bounds, polygons, uid_to_int, total_pi
     if polys.empty:
         return
 
-    tiles_file = config.OUTPUT_DIR / "tile_masks" / f"tile_{tile_id:05d}.tif"
+    tiles_file = get_tiles_dir() / f"tile_{tile_id:05d}.tif"
     tiles_file.parent.mkdir(parents=True, exist_ok=True)
 
     transform = from_bounds(
@@ -206,8 +224,8 @@ def load_or_create_raster_tiles(polygons_path):
     Returns:
         list: List of dictionaries containing tile metadata (id, bounds).
     """
-    tiles_dir = config.OUTPUT_DIR / "tile_masks"
-    mapping_file = config.OUTPUT_DIR / "uid_mapping.json"
+    tiles_dir = get_tiles_dir()
+    mapping_file = get_mapping_file()
 
     if tiles_dir.exists() and mapping_file.exists():
         try:
@@ -408,7 +426,7 @@ def log_memory():
 
 def load_tile_mask(tile_id):
     """Loads the raster mask for a specific tile ID from disk."""
-    tiles_file = config.OUTPUT_DIR / "tile_masks" / f"tile_{tile_id:05d}.tif"
+    tiles_file = get_tiles_dir() / f"tile_{tile_id:05d}.tif"
     if tiles_file.exists():
         with rasterio.open(tiles_file) as src:
             return src.read(1)
@@ -467,7 +485,7 @@ def zonal_mean(ndvi, clear_mask, tiles, int_to_uid):
         "clear_pixels": clear_counts[valid_mask],
     })
 
-
+@cache_search
 def search_stac_collection(catalog, collections, bbox, start_date, end_date, description):
     """Helper to search STAC catalog with error handling."""
     logger.info(f"  Searching for {description} data {start_date} to {end_date}...")
@@ -512,7 +530,7 @@ def load_landsat_macro(items, bbox_wgs84, macro_id, year, month):
         )
     except Exception as e:
         logger.error(f"Landsat load failed for macro-tile {macro_id}: {e}")
-        return None, None
+        raise
 
     if (
         landsat_ds is None
@@ -597,6 +615,21 @@ def apply_wofs_mask(ndvi, wofs_items, bbox_wgs84, macro_id):
 # MACRO-REGION PROCESSING
 # =========================
 
+def cache_empty_tile(cache_file):
+    """Writes an empty DataFrame to the cache file to prevent reprocessing."""
+    df = pd.DataFrame({
+        config.POLY_UNIQUE_ID: pd.Series(dtype="object"),
+        "ndvi": pd.Series(dtype="float64"),
+        "count": pd.Series(dtype="int32"),
+        "clear_pixels": pd.Series(dtype="int32"),
+    })
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(cache_file)
+    except Exception as e:
+        logger.warning(f"Failed to write empty cache {cache_file}: {e}")
+    return df
+
 @delayed
 def process_tile_from_macro(tile, ndvi_med, clear_mask_med, tile_masks):
     """
@@ -624,7 +657,7 @@ def process_tile_from_macro(tile, ndvi_med, clear_mask_med, tile_masks):
     tiles_mask = tile_masks.get(tile_id)
     if tiles_mask is None:
         logger.debug(f"Tile {tile_id} has no mask, skipping")
-        return None
+        return cache_empty_tile(cache_file)
 
     tx0, ty0, tx1, ty1 = tile["bounds"]
 
@@ -633,17 +666,17 @@ def process_tile_from_macro(tile, ndvi_med, clear_mask_med, tile_masks):
         tile_clear = clear_mask_med.sel(x=slice(tx0, tx1), y=slice(ty1, ty0))
     except (KeyError, ValueError):
         logger.debug(f"Tile {tile_id} has no data, skipping")
-        return None
+        return cache_empty_tile(cache_file)
 
     if tile_ndvi.sizes.get("x", 0) == 0 or tile_ndvi.sizes.get("y", 0) == 0:
         logger.debug(
             f"Tile {tile_id} has no data (x or y dimension zero length), skipping"
         )
-        return None
+        return cache_empty_tile(cache_file)
 
     if tile_ndvi.isnull().all():
         logger.debug(f"Tile {tile_id} fully masked, skipping")
-        return None
+        return cache_empty_tile(cache_file)
 
     result = zonal_mean(tile_ndvi, tile_clear, tiles_mask, int_to_uid)
     del tile_ndvi, tile_clear, tiles_mask
@@ -655,8 +688,9 @@ def process_tile_from_macro(tile, ndvi_med, clear_mask_med, tile_masks):
         except Exception as e:
             logger.warning(f"Failed to cache tile {tile_id}: {e}")
             cache_file.unlink(missing_ok=True)
+        return result
 
-    return result
+    return cache_empty_tile(cache_file)
 
 
 def process_macro_tile(macro_tile, year, month, items, wofs_items):
@@ -701,6 +735,10 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
 
     ndvi, clear_mask = load_landsat_macro(items, bbox_wgs84, macro_id, year, month)
     if ndvi is None:
+        logger.info(f"      Macro-tile {macro_id}: No data found. Caching empty results for {len(uncached_tiles)} tiles.")
+        for tile in uncached_tiles:
+             cache_file = cache_dir / f"tile_{tile['tile_id']:05d}.parquet"
+             cached_tiles.append(cache_empty_tile(cache_file))
         return cached_tiles
 
     if wofs_items:
@@ -710,6 +748,10 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
 
     if ndvi.isnull().all():
         logger.info(f"      Macro-tile {macro_id}: NDVI fully masked ({year}-{month:02d})")
+        logger.info(f"      Macro-tile {macro_id}: NDVI fully masked ({year}-{month:02d}). Caching empty results.")
+        for tile in uncached_tiles:
+             cache_file = cache_dir / f"tile_{tile['tile_id']:05d}.parquet"
+             cached_tiles.append(cache_empty_tile(cache_file))
         return cached_tiles
 
     # -------------------------
@@ -793,7 +835,7 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
     # preload_future_wofs = cache._executor.submit(cache.cache_items, wofs_items, ["water"], tile_bboxes)
     # Fire-and-forget — submit from MAIN THREAD
     if STACCache:
-        cache = STACCache.get_instance(patch_url_delay=3, max_rate_mb=40)
+        cache = STACCache.get_instance()
         cache.submit_batches(
             [(items, landsat_bands), (wofs_items, ["water"])],
             intersection_filter=macro_bboxes,
@@ -832,11 +874,20 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
     # preload_future_landsat.result()
     # preload_future_wofs.result()
 
-    if not all_results:
+    # Filter empty DataFrames to prevent FutureWarning in pd.concat
+    valid_results = [df for df in all_results if not df.empty]
+
+    if not valid_results:
         logger.info(f"  No results for {year}-{month:02d}. Creating empty baseline.")
-        combined = pd.DataFrame(columns=[config.POLY_UNIQUE_ID, "ndvi", "count", "clear_pixels", "w_ndvi"])
+        combined = pd.DataFrame({
+            config.POLY_UNIQUE_ID: pd.Series(dtype="object"),
+            "ndvi": pd.Series(dtype="float64"),
+            "count": pd.Series(dtype="int32"),
+            "clear_pixels": pd.Series(dtype="int32"),
+            "w_ndvi": pd.Series(dtype="float64"),
+        })
     else:
-        combined = pd.concat(all_results, ignore_index=True)
+        combined = pd.concat(valid_results, ignore_index=True)
         combined["w_ndvi"] = combined["ndvi"] * combined["count"]
 
     aggregated = (
@@ -849,7 +900,7 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
         .reset_index()
     )
 
-    mapping_file = config.OUTPUT_DIR / "uid_mapping.json"
+    mapping_file = get_mapping_file()
     with open(mapping_file) as f:
         data = json.load(f)
     all_uids_df = pd.DataFrame(data["polygons"], columns=["int_value", config.POLY_UNIQUE_ID, "total_pixels"])
@@ -899,6 +950,7 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
 def main():
     """Main execution entry point for Landsat NDVI processing."""
     setup_logging(config.LOG_DIR, "ndvi_processing")
+
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     raster_tiles = load_or_create_raster_tiles(config.POLYGON_PATH)
