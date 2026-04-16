@@ -38,6 +38,7 @@ from shapely.geometry import box
 import odc.stac
 from odc.geo.crs import CRS as GeoCRS
 from odc.geo.geom import Geometry, box as geo_box
+from odc.geo.geobox import GeoBox
 from pystac_client import Client
 
 import psutil
@@ -50,11 +51,11 @@ import threading
 import sys
 # Add project root to sys.path to allow imports from config.py and tools/
 # This handles cases where the script is moved to a subfolder (e.g., input_pipelines/)
-current_dir = Path(__file__).resolve().parent
-if (current_dir / "config.py").exists():
-    project_root = current_dir
+current_path = Path(__file__).resolve().parent
+if (current_path / "config.py").exists():
+    project_root = current_path
 else:
-    project_root = current_dir.parent
+    project_root = current_path.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
@@ -75,7 +76,9 @@ _instance = STACCache.get_instance() if STACCache else None
 cache_search = _instance.cache_search if _instance else _noop_decorator
 ###################################################
 
-from config import ndvi_landsat_cfg as config
+
+from config import NDVILandsatConfig, load_config
+
 logger = logging.getLogger(__name__)
 
 # silence noisy warning from rasterio during dask startup
@@ -88,14 +91,57 @@ warnings.filterwarnings(
     category=NotGeoreferencedWarning
 )  
 
+
+def validate_config(config: NDVILandsatConfig) -> None:
+    """
+    Validates configuration before processing starts.
+    Catches issues early rather than failing hours into a batch job.
+    """
+    errors = []
+    warnings = []
+
+    # 1. Check critical paths exist
+    if not config.shapefile_path.is_file():
+        errors.append(f"shapefile_path is not a file: {config.shapefile_path}")
+
+    # 2. Check value ranges
+    if config.pixel_size <= 0:
+        errors.append(f"pixel_size must be positive, got: {config.pixel_size}")
+
+    if config.tile_pixels < 256:
+        warnings.append(f"tile_pixels is very small ({config.tile_pixels}), which may increase overhead.")
+
+    if config.macro_tile_factor < 1:
+        errors.append(f"macro_tile_factor must be >= 1, got: {config.macro_tile_factor}")
+
+    # 3. Check STAC URL
+    if not config.stac_url.startswith("http"):
+        errors.append(f"stac_url must be a valid URL, got: {config.stac_url}")
+
+    # Report results
+    if warnings:
+        for w in warnings:
+            logger.warning(f"Config warning: {w}")
+
+    if errors:
+        error_msg = "Configuration validation failed:\n" + "\n".join(
+            f"  - {e}" for e in errors
+        )
+        raise ValueError(error_msg)
+
+
+
+
 # =========================
 # PATH MANAGEMENT
 # =========================
-def get_tiles_dir():
-    return config.OUTPUT_DIR / "tile_masks"
+def get_tiles_path(config):
+    return config.output_path / "tile_masks"
 
-def get_mapping_file():
-    return get_tiles_dir() / "uid_mapping.json"
+
+def get_mapping_file(config: NDVILandsatConfig):
+    return get_tiles_path(config) / "uid_mapping.json"
+
 
 # =========================
 # SPATIAL GRID
@@ -104,14 +150,14 @@ def get_mapping_file():
 _WORKER_UID_CACHE = None
 
 
-def get_mapping_on_worker():
+def get_mapping_on_worker(config: NDVILandsatConfig):
     """
     Lazy-loads only the int_to_uid mapping into worker memory.
     """
     global _WORKER_UID_CACHE
     if _WORKER_UID_CACHE is None:
-        mapping_file = get_mapping_file().resolve()
-        
+        mapping_file = get_mapping_file(config).resolve()
+
         try:
             with open(mapping_file) as f:
                 data = json.load(f)
@@ -119,18 +165,19 @@ def get_mapping_on_worker():
                 logger.debug(f"Worker loaded {len(_WORKER_UID_CACHE)} UIDs from {mapping_file}")
         except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
             raise RuntimeError(f"Worker failed to load mapping from {mapping_file}: {e}")
-            
+
     return _WORKER_UID_CACHE
 
-def get_global_uid_mapping():
+
+def get_global_uid_mapping(config: NDVILandsatConfig):
     """Load existing UID mapping. Must be created during rasterization."""
-    mapping_file = get_mapping_file()
+    mapping_file = get_mapping_file(config)
     if not mapping_file.exists():
         raise RuntimeError(
             f"UID mapping file {mapping_file} does not exist. "
             "Run rasterization first to generate tiles and mapping together."
         )
-    
+
     try:
         with open(mapping_file) as f:
             data = json.load(f)
@@ -151,7 +198,15 @@ def compute_tile_hash(tile_path):
     return sha256.hexdigest()[:16]
 
 
-def rasterize_tile_polygons(tile_id, tile_bounds, polygons, uid_to_int, total_pixels, tile_hashes):
+def rasterize_tile_polygons(
+    tile_id,
+    tile_bounds,
+    polygons,
+    uid_to_int,
+    total_pixels,
+    tile_hashes,
+    config: NDVILandsatConfig,
+):
     """
     Rasterizes polygons within a specific tile and updates pixel counts.
 
@@ -162,6 +217,7 @@ def rasterize_tile_polygons(tile_id, tile_bounds, polygons, uid_to_int, total_pi
         uid_to_int (dict): Mapping from UID string to integer ID.
         total_pixels (dict): Dictionary to update with pixel counts per UID.
         tile_hashes (dict): Dictionary to store hash of generated tile file.
+        config (NDVILandsatConfig): Configuration object.
     """
     minx, miny, maxx, maxy = tile_bounds
     tile_geom = box(minx, miny, maxx, maxy)
@@ -170,26 +226,26 @@ def rasterize_tile_polygons(tile_id, tile_bounds, polygons, uid_to_int, total_pi
     if polys.empty:
         return
 
-    tiles_file = get_tiles_dir() / f"tile_{tile_id:05d}.tif"
+    tiles_file = get_tiles_path(config) / f"tile_{tile_id:05d}.tif"
     tiles_file.parent.mkdir(parents=True, exist_ok=True)
 
     transform = from_bounds(
-        minx, miny, maxx, maxy, config.TILE_PIXELS, config.TILE_PIXELS
+        minx, miny, maxx, maxy, config.tile_pixels, config.tile_pixels
     )
     polys_mapped = polys.copy()
-    polys_mapped["raster_id"] = polys_mapped[config.POLY_UNIQUE_ID].map(uid_to_int)
+    polys_mapped["raster_id"] = polys_mapped[config.poly_unique_id].map(uid_to_int)
 
     shapes = zip(polys_mapped.geometry, polys_mapped["raster_id"])
     tiles = rasterize(
         shapes,
-        out_shape=(config.TILE_PIXELS, config.TILE_PIXELS),
+        out_shape=(config.tile_pixels, config.tile_pixels),
         transform=transform,
         fill=0,
         dtype="int32",
     )
 
     unique, counts = np.unique(tiles[tiles > 0], return_counts=True)
-    uid_to_string = polys_mapped.set_index("raster_id")[config.POLY_UNIQUE_ID].to_dict()
+    uid_to_string = polys_mapped.set_index("raster_id")[config.poly_unique_id].to_dict()
     for uid_int, count in zip(unique, counts):
         uid = uid_to_string[uid_int]
         total_pixels[uid] = total_pixels.get(uid, 0) + count
@@ -198,20 +254,20 @@ def rasterize_tile_polygons(tile_id, tile_bounds, polygons, uid_to_int, total_pi
         tiles_file,
         "w",
         driver="GTiff",
-        height=config.TILE_PIXELS,
-        width=config.TILE_PIXELS,
+        height=config.tile_pixels,
+        width=config.tile_pixels,
         count=1,
         dtype="int32",
-        crs=config.CRS,
+        crs=config.crs,
         transform=transform,
         compress="lzw",
     ) as dst:
         dst.write(tiles, 1)
-    
+
     tile_hashes[str(tile_id)] = compute_tile_hash(tiles_file)
 
 
-def load_or_create_raster_tiles(polygons_path):
+def load_or_create_raster_tiles(config: NDVILandsatConfig):
     """
     Loads existing raster tiles or generates them from the polygon shapefile.
 
@@ -219,42 +275,42 @@ def load_or_create_raster_tiles(polygons_path):
     are missing, regenerates the entire tiling scheme.
 
     Args:
-        polygons_path (Path): Path to the input polygon shapefile.
+        config (NDVILandsatConfig): Configuration object.
 
     Returns:
         list: List of dictionaries containing tile metadata (id, bounds).
     """
-    tiles_dir = get_tiles_dir()
-    mapping_file = get_mapping_file()
+    tiles_path = get_tiles_path(config)
+    mapping_file = get_mapping_file(config)
 
-    if tiles_dir.exists() and mapping_file.exists():
+    if tiles_path.exists() and mapping_file.exists():
         try:
             with open(mapping_file) as f:
                 data = json.load(f)
                 expected_hashes = data.get("tile_hashes", {})
-            
+
             tiles = []
             mismatched = []
-            
-            for f in tiles_dir.glob("tile_*.tif"):
+
+            for f in tiles_path.glob("tile_*.tif"):
                 tile_id = int(f.stem.split("_")[1])
                 tile_id_str = str(tile_id)
-                
+
                 if tile_id_str in expected_hashes:
                     if compute_tile_hash(f) != expected_hashes[tile_id_str]:
                         mismatched.append(tile_id)
                         continue
-                
+
                 with rasterio.open(f) as src:
                     tiles.append({
                         "tile_id": tile_id,
                         "bounds": (src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top),
                     })
-            
+
             found_ids = {t["tile_id"] for t in tiles}
             expected_ids = {int(k) for k in expected_hashes.keys()}
             missing = expected_ids - found_ids
-            
+
             if missing or mismatched:
                 logger.warning(f"Missing: {len(missing)}, Corrupted: {len(mismatched)} tiles")
                 logger.info("Regenerating all tiles")
@@ -265,26 +321,26 @@ def load_or_create_raster_tiles(polygons_path):
             logger.warning(f"Validation failed: {e}")
 
     logger.info("Generating raster tiles and UID mapping...")
-    if tiles_dir.exists():
-        shutil.rmtree(tiles_dir)
-    tiles_dir.mkdir(parents=True)
+    if tiles_path.exists():
+        shutil.rmtree(tiles_path)
+    tiles_path.mkdir(parents=True)
     mapping_file.unlink(missing_ok=True)
 
-    polygons = gpd.read_file(polygons_path).to_crs(config.CRS)
-    
-    unique_uids = sorted(polygons[config.POLY_UNIQUE_ID].unique())
+    polygons = gpd.read_file(config.shapefile_path).to_crs(config.crs)
+
+    unique_uids = sorted(polygons[config.poly_unique_id].unique())
     uid_to_int = {uid: i + 1 for i, uid in enumerate(unique_uids)}
 
     minx, miny, maxx, maxy = polygons.total_bounds
-    tile_size = config.TILE_PIXELS * config.PIXEL_SIZE
+    tile_size = config.tile_pixels * config.pixel_size
     xs = np.arange(
-        np.floor(minx / config.PIXEL_SIZE) * config.PIXEL_SIZE,
-        np.ceil(maxx / config.PIXEL_SIZE) * config.PIXEL_SIZE,
+        np.floor(minx / config.pixel_size) * config.pixel_size,
+        np.ceil(maxx / config.pixel_size) * config.pixel_size,
         tile_size,
     )
     ys = np.arange(
-        np.floor(miny / config.PIXEL_SIZE) * config.PIXEL_SIZE,
-        np.ceil(maxy / config.PIXEL_SIZE) * config.PIXEL_SIZE,
+        np.floor(miny / config.pixel_size) * config.pixel_size,
+        np.ceil(maxy / config.pixel_size) * config.pixel_size,
         tile_size,
     )
 
@@ -299,20 +355,23 @@ def load_or_create_raster_tiles(polygons_path):
             uid_to_int,
             total_pixels,
             tile_hashes,
+            config,
         )
     logger.info("Raster tile generation complete.")
-    
+
     # Build polygon data: [int_value, uid, pixel_count]
     polygon_data = [[uid_to_int[uid], uid, int(total_pixels.get(uid, 0))] for uid in unique_uids]
-    
+
     with open(mapping_file, "w") as f:
         json.dump({"polygons": polygon_data, "tile_hashes": tile_hashes}, f, indent=2)
-    logger.info(f"Created UID mapping: {len(polygon_data)} polygons, {len(tile_hashes)} tiles ({config.PIXEL_SIZE}m)")
+    logger.info(
+        f"Created UID mapping: {len(polygon_data)} polygons, {len(tile_hashes)} tiles ({config.pixel_size}m)"
+    )
 
-    return load_or_create_raster_tiles(polygons_path)
+    return load_or_create_raster_tiles(config)
 
 
-def create_macro_tiles(raster_tiles):
+def create_macro_tiles(raster_tiles, config: NDVILandsatConfig):
     """Group tiles into macro-regions (8192×8192 pixels)."""
     if not raster_tiles:
         return []
@@ -320,7 +379,7 @@ def create_macro_tiles(raster_tiles):
     # Get tile size from first tile bounds
     first_tile = raster_tiles[0]["bounds"]
     tile_size_m = first_tile[2] - first_tile[0]  # maxx - minx in meters
-    macro_size_m = tile_size_m * config.MACRO_TILE_FACTOR
+    macro_size_m = tile_size_m * config.macro_tile_factor
 
     all_bounds = [t["bounds"] for t in raster_tiles]
     minx = min(b[0] for b in all_bounds)
@@ -349,7 +408,10 @@ def create_macro_tiles(raster_tiles):
                     {
                         "macro_id": macro_id,
                         "bounds": macro_bbox,
-                        "bounds_wgs84": bbox_to_wgs84(macro_bbox),
+                        "bounds_wgs84": bbox_to_wgs84(macro_bbox, config),
+                        "geobox": GeoBox.from_bbox(
+                            macro_bbox, GeoCRS(config.crs), resolution=config.pixel_size
+                        ),
                         "tiles": tiles_in_macro,
                     }
                 )
@@ -357,8 +419,8 @@ def create_macro_tiles(raster_tiles):
 
             x += macro_size_m
         y += macro_size_m
-    tile_size_px = int(tile_size_m/config.PIXEL_SIZE)
-    macro_size_px = tile_size_px * config.MACRO_TILE_FACTOR
+    tile_size_px = int(tile_size_m / config.pixel_size)
+    macro_size_px = tile_size_px * config.macro_tile_factor
     logger.info(f"{len(raster_tiles)} tiles ({tile_size_px}×{tile_size_px} = {tile_size_m/1000:.1f}km²) grouped into {len(macro_tiles)} macro-tiles ({macro_size_px}×{macro_size_px} = {macro_size_m/1000:.1f}km²)")
     return macro_tiles
 
@@ -368,12 +430,14 @@ def create_macro_tiles(raster_tiles):
 # =========================
 
 
-def check_dask_graph(obj, name="object", max_tasks=None, max_partitions=None):
+def check_dask_graph(
+    obj, config: NDVILandsatConfig, name="object", max_tasks=None, max_partitions=None
+):
     """Monitor Dask graph size and raise error if thresholds exceeded."""
     if max_tasks is None:
-        max_tasks = config.MAX_DASK_TASKS
+        max_tasks = config.max_dask_tasks
     if max_partitions is None:
-        max_partitions = config.MAX_DASK_PARTITIONS
+        max_partitions = config.max_dask_partitions
 
     try:
         if hasattr(obj, "__dask_graph__"):
@@ -399,24 +463,25 @@ def check_dask_graph(obj, name="object", max_tasks=None, max_partitions=None):
         logger.warning(f"Could not check {name}: {e}")
 
 
-def bbox_to_wgs84(bbox):
+def bbox_to_wgs84(bbox, config: NDVILandsatConfig):
     """Converts a bounding box from the project CRS to WGS84 (EPSG:4326)."""
     for i, x in enumerate(bbox):
         if not np.isfinite(x):
             raise ValueError(f"Invalid bbox coordinate at index {i}: {x} in {bbox}")
-    geom = Geometry(geo_box(*bbox, GeoCRS(config.CRS)))
+    geom = Geometry(geo_box(*bbox, GeoCRS(config.crs)))
     geom_wgs84 = geom.to_crs("EPSG:4326").boundingbox
     return [geom_wgs84.left, geom_wgs84.bottom, geom_wgs84.right, geom_wgs84.top]
 
 
-def stac_client():
+def stac_client(config: NDVILandsatConfig):
     """Initializes and returns a PySTAC Client for the configured STAC URL."""
     try:
         # Change 'request_session' to 'session'
-        return Client.open(config.STAC_URL)
+        return Client.open(config.stac_url)
     except Exception as e:
-        logger.error(f"Failed to connect to STAC catalog at {config.STAC_URL}: {e}")
+        logger.error(f"Failed to connect to STAC catalog at {config.stac_url}: {e}")
         raise
+
 
 def log_memory():
     """Log current memory usage."""
@@ -424,9 +489,9 @@ def log_memory():
     return f"{mem.percent:.1f}% ({mem.used / (1024**3):.1f}/{mem.total / (1024**3):.1f} GB)"
 
 
-def load_tile_mask(tile_id):
+def load_tile_mask(tile_id, config: NDVILandsatConfig):
     """Loads the raster mask for a specific tile ID from disk."""
-    tiles_file = get_tiles_dir() / f"tile_{tile_id:05d}.tif"
+    tiles_file = get_tiles_path(config) / f"tile_{tile_id:05d}.tif"
     if tiles_file.exists():
         with rasterio.open(tiles_file) as src:
             return src.read(1)
@@ -438,7 +503,7 @@ def compute_ndvi(red, nir):
     return (nir - red) / (nir + red + 1e-6)
 
 
-def zonal_mean(ndvi, clear_mask, tiles, int_to_uid):
+def zonal_mean(ndvi, clear_mask, tiles, int_to_uid, config: NDVILandsatConfig):
     """
     Computes zonal statistics (mean NDVI, counts) for polygons within a tile.
 
@@ -447,6 +512,7 @@ def zonal_mean(ndvi, clear_mask, tiles, int_to_uid):
         clear_mask (xarray.DataArray): Boolean mask of clear pixels.
         tiles (numpy.ndarray): Rasterized polygon IDs for the tile.
         int_to_uid (dict): Mapping from integer raster IDs to string UIDs.
+        config (NDVILandsatConfig): Configuration object.
 
     Returns:
         pd.DataFrame: Zonal statistics for the tile, or None if no valid data.
@@ -456,7 +522,7 @@ def zonal_mean(ndvi, clear_mask, tiles, int_to_uid):
     lb = tiles
 
     valid_poly = (lb > 0) & (~np.isnan(nd))
-    
+
     if not np.any(valid_poly):
         return None
 
@@ -477,13 +543,14 @@ def zonal_mean(ndvi, clear_mask, tiles, int_to_uid):
 
     string_uids = [int_to_uid.get(int_id) for int_id in unique_ids]
     valid_mask = [u is not None for u in string_uids]
-    
+
     return pd.DataFrame({
-        config.POLY_UNIQUE_ID: [u for u in string_uids if u is not None],
+        config.poly_unique_id: [u for u in string_uids if u is not None],
         "ndvi": means[valid_mask],
         "count": counts[valid_mask],
         "clear_pixels": clear_counts[valid_mask],
     })
+
 
 @cache_search
 def search_stac_collection(catalog, collections, bbox, start_date, end_date, description):
@@ -499,32 +566,30 @@ def search_stac_collection(catalog, collections, bbox, start_date, end_date, des
     except Exception as e:
         logger.error(f"  {description} STAC search failed: {e}")
         return None
-    
+
     if len(items) == 0:
         logger.info(f"  No {description} data for {start_date[:7]}")
         return None
-        
+
     logger.info(f"  - Found {len(items)} {description} items")
     return items
 
 
-def load_landsat_macro(items, bbox_wgs84, macro_id, year, month):
+def load_landsat_macro(items, geobox, macro_id, year, month, config: NDVILandsatConfig):
     """Loads Landsat data, computes NDVI and clear mask for a macro-tile."""
     logger.debug(f"   Macro-tile {macro_id}: loading landsat data...")
 
     bands = ["nbart_red", "nbart_nir", "oa_fmask"]
-    
+
     patch_url = STACCache.get_instance().patch_url if STACCache else None
-    
+
     try:
         landsat_ds = odc.stac.load(
             items,
             bands=bands,
-            bbox=bbox_wgs84,
-            crs=config.CRS,
-            resolution=30,
+            geobox=geobox,
             groupby="solar_day",
-            chunks={"time": 1, "x": config.TILE_PIXELS, "y": config.TILE_PIXELS},
+            chunks={"time": 1, "x": config.tile_pixels, "y": config.tile_pixels},
             fail_on_error=False,
             patch_url=patch_url,
         )
@@ -546,7 +611,7 @@ def load_landsat_macro(items, bbox_wgs84, macro_id, year, month):
     )
 
     landsat_ds = landsat_ds.persist()
-    check_dask_graph(landsat_ds, "landsat_ds after persist")
+    check_dask_graph(landsat_ds, config, "landsat_ds after persist")
     logger.debug(f"      Memory after Landsat load: {log_memory()}")
 
     # Clear mask & NDVI
@@ -565,7 +630,7 @@ def load_landsat_macro(items, bbox_wgs84, macro_id, year, month):
     return ndvi, clear_mask
 
 
-def apply_wofs_mask(ndvi, wofs_items, bbox_wgs84, macro_id):
+def apply_wofs_mask(ndvi, wofs_items, geobox, macro_id, config: NDVILandsatConfig):
     """Loads WOfS data and masks open water from NDVI."""
     logger.debug(f"   Macro-tile {macro_id}: loading WOfS data and open water mask")
 
@@ -575,11 +640,9 @@ def apply_wofs_mask(ndvi, wofs_items, bbox_wgs84, macro_id):
         wofs_data = odc.stac.load(
             wofs_items,
             bands=["water"],
-            bbox=bbox_wgs84,
-            crs=config.CRS,
-            resolution=30,
+            geobox=geobox,
             groupby="solar_day",
-            chunks={"time": 1, "x": config.TILE_PIXELS, "y": config.TILE_PIXELS},
+            chunks={"time": 1, "x": config.tile_pixels, "y": config.tile_pixels},
             fail_on_error=False,
             patch_url=patch_url,
         )
@@ -615,10 +678,11 @@ def apply_wofs_mask(ndvi, wofs_items, bbox_wgs84, macro_id):
 # MACRO-REGION PROCESSING
 # =========================
 
-def cache_empty_tile(cache_file):
+
+def cache_empty_tile(cache_file, config: NDVILandsatConfig):
     """Writes an empty DataFrame to the cache file to prevent reprocessing."""
     df = pd.DataFrame({
-        config.POLY_UNIQUE_ID: pd.Series(dtype="object"),
+        config.poly_unique_id: pd.Series(dtype="object"),
         "ndvi": pd.Series(dtype="float64"),
         "count": pd.Series(dtype="int32"),
         "clear_pixels": pd.Series(dtype="int32"),
@@ -630,18 +694,21 @@ def cache_empty_tile(cache_file):
         logger.warning(f"Failed to write empty cache {cache_file}: {e}")
     return df
 
+
 @delayed
-def process_tile_from_macro(tile, ndvi_med, clear_mask_med, tile_masks):
+def process_tile_from_macro(
+    tile, ndvi_med, clear_mask_med, tile_masks, config: NDVILandsatConfig
+):
     """
     Worker-level processing: loads mapping from local cache and computes zonal stats.
     Processes a single sub-tile via spatial slicing from macro-region data.
     """
     # Retrieve the mapping from the local process memory
-    int_to_uid = get_mapping_on_worker()
-    
+    int_to_uid = get_mapping_on_worker(config)
+
     tile_id = tile["tile_id"]
     cache_file = (
-        config.OUTPUT_DIR
+        config.output_path
         / "cache"
         / f"{ndvi_med.attrs['year']}_{ndvi_med.attrs['month']:02d}"
         / f"tile_{tile_id:05d}.parquet"
@@ -653,11 +720,11 @@ def process_tile_from_macro(tile, ndvi_med, clear_mask_med, tile_masks):
     # Resolve Future if needed (when called via dask.delayed)
     if isinstance(tile_masks, Future):
         tile_masks = tile_masks.result()
-    
+
     tiles_mask = tile_masks.get(tile_id)
     if tiles_mask is None:
         logger.debug(f"Tile {tile_id} has no mask, skipping")
-        return cache_empty_tile(cache_file)
+        return cache_empty_tile(cache_file, config)
 
     tx0, ty0, tx1, ty1 = tile["bounds"]
 
@@ -666,19 +733,19 @@ def process_tile_from_macro(tile, ndvi_med, clear_mask_med, tile_masks):
         tile_clear = clear_mask_med.sel(x=slice(tx0, tx1), y=slice(ty1, ty0))
     except (KeyError, ValueError):
         logger.debug(f"Tile {tile_id} has no data, skipping")
-        return cache_empty_tile(cache_file)
+        return cache_empty_tile(cache_file, config)
 
     if tile_ndvi.sizes.get("x", 0) == 0 or tile_ndvi.sizes.get("y", 0) == 0:
         logger.debug(
             f"Tile {tile_id} has no data (x or y dimension zero length), skipping"
         )
-        return cache_empty_tile(cache_file)
+        return cache_empty_tile(cache_file, config)
 
     if tile_ndvi.isnull().all():
         logger.debug(f"Tile {tile_id} fully masked, skipping")
-        return cache_empty_tile(cache_file)
+        return cache_empty_tile(cache_file, config)
 
-    result = zonal_mean(tile_ndvi, tile_clear, tiles_mask, int_to_uid)
+    result = zonal_mean(tile_ndvi, tile_clear, tiles_mask, int_to_uid, config)
     del tile_ndvi, tile_clear, tiles_mask
 
     if result is not None:
@@ -690,10 +757,12 @@ def process_tile_from_macro(tile, ndvi_med, clear_mask_med, tile_masks):
             cache_file.unlink(missing_ok=True)
         return result
 
-    return cache_empty_tile(cache_file)
+    return cache_empty_tile(cache_file, config)
 
 
-def process_macro_tile(macro_tile, year, month, items, wofs_items):
+def process_macro_tile(
+    macro_tile, year, month, items, wofs_items, config: NDVILandsatConfig
+):
     """
     Process a macro-tile (8192x8192) by loading Landsat/NDVI once, masking with WOfS,
     aggregating to monthly median, and processing all sub-tiles (2048x2048) sequentially.
@@ -702,14 +771,14 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
 
     macro_id = macro_tile["macro_id"]
     tiles = macro_tile["tiles"]
-    bbox_wgs84 = macro_tile["bounds_wgs84"]
+    geobox = macro_tile["geobox"]
 
-    cache_dir = config.OUTPUT_DIR / "cache" / f"{year}_{month:02d}"
+    cache_path = config.output_path / "cache" / f"{year}_{month:02d}"
     cached_tiles = []
     uncached_tiles = []
 
     for tile in tiles:
-        cache_file = cache_dir / f"tile_{tile['tile_id']:05d}.parquet"
+        cache_file = cache_path / f"tile_{tile['tile_id']:05d}.parquet"
         if cache_file.exists():
             try:
                 cached_tiles.append(pd.read_parquet(cache_file))
@@ -727,22 +796,25 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
         f"   Macro-tile {macro_id}: processing {len(uncached_tiles)}/{len(tiles)} sub-tiles"
     )
 
-    tile_masks = {tile["tile_id"]: load_tile_mask(tile["tile_id"]) for tile in uncached_tiles}
+    tile_masks = {
+        tile["tile_id"]: load_tile_mask(tile["tile_id"], config)
+        for tile in uncached_tiles
+    }
     tile_masks = {k: v for k, v in tile_masks.items() if v is not None}
 
     dask_client = get_client()
     tile_masks_future = dask_client.scatter(tile_masks, broadcast=True)
 
-    ndvi, clear_mask = load_landsat_macro(items, bbox_wgs84, macro_id, year, month)
+    ndvi, clear_mask = load_landsat_macro(items, geobox, macro_id, year, month, config)
     if ndvi is None:
         logger.info(f"      Macro-tile {macro_id}: No data found. Caching empty results for {len(uncached_tiles)} tiles.")
         for tile in uncached_tiles:
-             cache_file = cache_dir / f"tile_{tile['tile_id']:05d}.parquet"
-             cached_tiles.append(cache_empty_tile(cache_file))
+            cache_file = cache_path / f"tile_{tile['tile_id']:05d}.parquet"
+            cached_tiles.append(cache_empty_tile(cache_file, config))
         return cached_tiles
 
     if wofs_items:
-        ndvi = apply_wofs_mask(ndvi, wofs_items, bbox_wgs84, macro_id)
+        ndvi = apply_wofs_mask(ndvi, wofs_items, geobox, macro_id, config)
     else:
         logger.debug("WOfS data unavailable or empty")
 
@@ -750,8 +822,8 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
         logger.info(f"      Macro-tile {macro_id}: NDVI fully masked ({year}-{month:02d})")
         logger.info(f"      Macro-tile {macro_id}: NDVI fully masked ({year}-{month:02d}). Caching empty results.")
         for tile in uncached_tiles:
-             cache_file = cache_dir / f"tile_{tile['tile_id']:05d}.parquet"
-             cached_tiles.append(cache_empty_tile(cache_file))
+            cache_file = cache_path / f"tile_{tile['tile_id']:05d}.parquet"
+            cached_tiles.append(cache_empty_tile(cache_file, config))
         return cached_tiles
 
     # -------------------------
@@ -762,7 +834,7 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
     ndvi_med.attrs["month"] = month
     ndvi_med = ndvi_med.persist()
     del ndvi
-    check_dask_graph(ndvi_med, "ndvi_med after persist")
+    check_dask_graph(ndvi_med, config, "ndvi_med after persist")
 
     clear_mask_med = clear_mask.max("time")
     clear_mask_med = clear_mask_med.persist()
@@ -776,7 +848,7 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
     tile_tasks = []
     for tile in uncached_tiles:
         task = process_tile_from_macro(
-            tile, ndvi_med, clear_mask_med, tile_masks_future,
+            tile, ndvi_med, clear_mask_med, tile_masks_future, config
         )
         tile_tasks.append(task)
 
@@ -787,9 +859,11 @@ def process_macro_tile(macro_tile, year, month, items, wofs_items):
     return cached_tiles + [r for r in new_results if r is not None]
 
 
-def process_month(year, month, raster_tiles, macro_tiles, catalog):
+def process_one_month(
+    year, month, raster_tiles, macro_tiles, catalog, config: NDVILandsatConfig
+):
     """Process month using macro-region strategy."""
-    final_out = config.OUTPUT_DIR / f"NDVI_{year}_{month:02d}.parquet"
+    final_out = config.output_path / f"NDVI_{year}_{month:02d}.parquet"
     if final_out.exists():
         logger.info(f"  Found saved result {year}-{month:02d} in {final_out.name} - skipping processing")
         return
@@ -803,19 +877,19 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
         max(b[2] for b in all_bounds),
         max(b[3] for b in all_bounds),
     ]
-    bbox_wgs84 = bbox_to_wgs84(full_bbox)
+    bbox_wgs84 = bbox_to_wgs84(full_bbox, config)
 
     start = f"{year}-{month:02d}-01"
     end = f"{year}-{month:02d}-{calendar.monthrange(year, month)[1]}"
 
     items = search_stac_collection(
-        catalog, config.LANDSAT_COLLECTIONS, bbox_wgs84, start, end, "Landsat"
+        catalog, config.landsat_collections, bbox_wgs84, start, end, "Landsat"
     )
     if not items:
         return
 
     wofs_items = search_stac_collection(
-        catalog, [config.WOFS_COLLECTION], bbox_wgs84, start, end, "WOfS"
+        catalog, [config.wofs_collection], bbox_wgs84, start, end, "WOfS"
     )
     if not wofs_items:
         return
@@ -857,7 +931,7 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
         for attempt in range(max_retries):
             try:
                 res = process_macro_tile(
-                    macro_tile, year, month, items, wofs_items,
+                    macro_tile, year, month, items, wofs_items, config
                 )
                 if res:
                     all_results.extend(res)
@@ -880,7 +954,7 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
     if not valid_results:
         logger.info(f"  No results for {year}-{month:02d}. Creating empty baseline.")
         combined = pd.DataFrame({
-            config.POLY_UNIQUE_ID: pd.Series(dtype="object"),
+            config.poly_unique_id: pd.Series(dtype="object"),
             "ndvi": pd.Series(dtype="float64"),
             "count": pd.Series(dtype="int32"),
             "clear_pixels": pd.Series(dtype="int32"),
@@ -891,7 +965,7 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
         combined["w_ndvi"] = combined["ndvi"] * combined["count"]
 
     aggregated = (
-        combined.groupby(config.POLY_UNIQUE_ID)
+        combined.groupby(config.poly_unique_id)
         .agg(
             w_ndvi_sum=("w_ndvi", "sum"),
             count_sum=("count", "sum"),
@@ -900,13 +974,13 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
         .reset_index()
     )
 
-    mapping_file = get_mapping_file()
+    mapping_file = get_mapping_file(config)
     with open(mapping_file) as f:
         data = json.load(f)
-    all_uids_df = pd.DataFrame(data["polygons"], columns=["int_value", config.POLY_UNIQUE_ID, "total_pixels"])
-    all_uids_df = all_uids_df[[config.POLY_UNIQUE_ID, "total_pixels"]]  # Keep only UID and pixel count
+    all_uids_df = pd.DataFrame(data["polygons"], columns=["int_value", config.poly_unique_id, "total_pixels"])
+    all_uids_df = all_uids_df[[config.poly_unique_id, "total_pixels"]]  # Keep only UID and pixel count
 
-    final_result = all_uids_df.merge(aggregated, on=config.POLY_UNIQUE_ID, how="left")
+    final_result = all_uids_df.merge(aggregated, on=config.poly_unique_id, how="left")
 
     final_result["w_ndvi_sum"] = final_result["w_ndvi_sum"].fillna(0)
     final_result["count_sum"] = final_result["count_sum"].fillna(0)
@@ -949,29 +1023,39 @@ def process_month(year, month, raster_tiles, macro_tiles, catalog):
 
 def main():
     """Main execution entry point for Landsat NDVI processing."""
-    setup_logging(config.LOG_DIR, "ndvi_processing")
+    config: NDVILandsatConfig = load_config("ndvi_landsat")
+    validate_config(config)
+    setup_logging(config.log_path, "ndvi_processing")
+    # create output directory
+    try:
+        config.output_path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise RuntimeError(f"Cannot create output_dir {config.output_path}: {e}")
+    
 
-    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    #-----------------------------------------------------------------
+    # prepare pipeline
+    #-----------------------------------------------------------------
+       
+    raster_tiles = load_or_create_raster_tiles(config)
+    macro_tiles = create_macro_tiles(raster_tiles, config)
 
-    raster_tiles = load_or_create_raster_tiles(config.POLYGON_PATH)
-    macro_tiles = create_macro_tiles(raster_tiles)
-
-    if config.END_DATE is None:
+    if config.end_date is None:
         current_date = datetime.now()
         end_year, end_month = current_date.year, current_date.month - 1
         if end_month == 0:
             end_year -= 1
             end_month = 12
     else:
-        end_year, end_month = config.END_DATE
-    start_year, start_month = config.START_DATE
+        end_year, end_month = config.end_date
+    start_year, start_month = config.start_date
 
     logger.info(
         f"Processing {start_year}-{start_month:02d} to {end_year}-{end_month:02d}"
     )
 
-    # persistent session
-    catalog = stac_client()
+    # persistent stac session
+    catalog = stac_client(config)
     try:
         for year in range(start_year, end_year + 1):
             for month in range(1, 13):
@@ -979,11 +1063,12 @@ def main():
                     continue
                 if (year, month) > (end_year, end_month):
                     break
-                process_month(year, month, raster_tiles, macro_tiles, catalog)
+                process_one_month(year, month, raster_tiles, macro_tiles, catalog, config)
 
                 # Previous month's files are on disk and won't be looked up again.
     finally:
         try:
+            #close Dask
             get_client().close()
             if STACCache:
                 STACCache.get_instance().close()

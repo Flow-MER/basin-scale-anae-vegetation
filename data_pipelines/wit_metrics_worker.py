@@ -15,49 +15,108 @@ you edit config.py before executing wit_metrics_worker.py
 
 """
 
-import os
-import sys
-
 import numpy as np
 import pandas as pd
 import fiona
-import pyarrow.parquet as pq
 from shapely import geometry
-
-
-# import os  # is loaded above to set the working directory
-import glob
-import logging
 from pathlib import Path
 from tqdm import tqdm
 import time
 import multiprocessing
-from itertools import repeat
-
-# ------------------------------------------------------------------------------
-# Path & config setup
-# ------------------------------------------------------------------------------
-
-current_dir = Path(__file__).resolve().parent
-if (current_dir / "config.py").exists():
-    project_root = current_dir
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+import logging
+import sys
+# Add project root to sys.path to allow imports from config.py and tools/
+# This handles cases where the script is moved to a subfolder (e.g., input_pipelines/)
+current_path = Path(__file__).resolve().parent
+if (current_path / "config.py").exists():
+    project_root = current_path
 else:
-    project_root = current_dir.parent
-
+    project_root = current_path.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+from tools.logging_setup import setup_logging
 
-
-from config import wit_metrics_cfg as config
+from config import WITMetricsConfig, load_config
 
 logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------------------
+# validate inputs
+# ------------------------------------------------------------------------------
+
+def validate_config(config: WITMetricsConfig) -> None:
+    """
+    Validates configuration before processing starts.
+    Catches issues early rather than failing hours into a batch job.
+    """
+    errors = []
+    warnings = []
+
+    # 1. Check critical paths exist
+    if not config.wit_csv_path.exists():
+        errors.append(f"wit_csv_path is not a directory: {config.wit_csv_path}")
+
+    # Check if shapefile exists (only if area lookup is enabled)
+    if config.shapefile_path is not None:
+        if not config.shapefile_path.exists():
+            errors.append(f"shapefile_path does not exist: {config.shapefile_path}")
+        if not config.shapefile_path.suffix == ".shp":
+            warnings.append(
+                f"shapefile_path doesn't have .shp extension: {config.shapefile_path}"
+            )
+
+    # Check value ranges
+    if not 0 <= config.pc_missing_threshold <= 1:
+        errors.append(
+            f"pc_missing_threshold must be between 0 and 1, got: {config.pc_missing_threshold}"
+        )
+
+    if config.batch_size < 1:
+        errors.append(f"BATCH_SIZE must be >= 1, got: {config.batch_size}")
+
+    if config.threshold_percentile < 0 or config.threshold_percentile > 1:
+        errors.append(
+            f"threshold_percentile must be between 0 and 1 (0.3 recommended), got: {config.threshold_percentile}"
+        )
+
+    if config.min_threshold < 0 or config.min_threshold > 1:
+        errors.append(
+            f"min_threshold must be between 0 and 1 (0.05 recommended), got: {config.min_threshold}"
+        )
+
+    if config.max_threshold < 0 or config.max_threshold > 1:
+        errors.append(
+            f"max_threshold must be between 0 and 1 (0.5 recommended), got: {config.max_threshold}"
+        )
+
+    # Check MONTHLY_SUBSET validity
+    if config.monthly_subset is not None:
+        required_cols = ["feature_id", "date"]
+        missing = [col for col in required_cols if col not in config.monthly_subset]
+        if missing or len(config.monthly_subset) <= 2:
+            errors.append(
+                f"monthly_subset must include {required_cols} and at least one metric column"
+            )
+
+    # Report results
+    if warnings:
+        for w in warnings:
+            logger.warning(f"Config warning: {w}")
+
+    if errors:
+        error_msg = "Configuration validation failed:\n" + "\n".join(
+            f"  - {e}" for e in errors
+        )
+        raise ValueError(error_msg)
 
 # ------------------------------------------------------------------------------
 # Geometry helpers
 # ------------------------------------------------------------------------------
 
-
-def shape_list(key, values, shapefile):
+def shape_list(
+    key: str, values: Iterable, shapefile: Union[str, Path]
+) -> Iterator[Tuple[Any, Dict[str, Any]]]:
     """
     Yields features from a shapefile that match the given keys.
 
@@ -77,7 +136,9 @@ def shape_list(key, values, shapefile):
                 yield k, feat
 
 
-def get_areas(polygons, pkey):
+def get_areas(
+    polygons: Iterable[Tuple[Any, Dict[str, Any]]], pkey: str
+) -> Optional[pd.DataFrame]:
     """
     Calculates the area of each feature in hectares.
 
@@ -104,7 +165,7 @@ def get_areas(polygons, pkey):
 # ------------------------------------------------------------------------------
 
 
-def _add_combined_members(df, members):
+def _add_combined_members(df: pd.DataFrame, members: List[Any]) -> pd.DataFrame:
     """
     Adds combined metric columns to the DataFrame (e.g., 'water+wet').
 
@@ -125,7 +186,7 @@ def _add_combined_members(df, members):
     return df
 
 
-def _resample_metrics(df, freq, pkey):
+def _resample_metrics(df: pd.DataFrame, freq: str, pkey: str) -> pd.DataFrame:
     """
     Standard resampling logic.
     Calculates each stat independently and merges them at the end.
@@ -173,7 +234,12 @@ def _resample_metrics(df, freq, pkey):
 # ------------------------------------------------------------------------------
 
 
-def annual_metrics(wit_data, members=None, pkey="feature_id"):
+def annual_metrics(
+    wit_data: pd.DataFrame,
+    output_path: Path,
+    members: Optional[List[Any]] = None,
+    pkey: str = "feature_id",
+) -> pd.DataFrame:
     """
     Computes annual statistics for WIT members using optimized single-pass resampling.
 
@@ -214,13 +280,18 @@ def annual_metrics(wit_data, members=None, pkey="feature_id"):
     res.insert(1, "year", res["date"].dt.year)
 
     # 5. Save output
-    out = config.OUTPUT_DIR / f"WIT_yearly_metrics{chunk}.parquet"
+    out = output_path / f"WIT_yearly_metrics{chunk}.parquet"
     write_batch_parquet(res, out)
 
     return res
 
 
-def monthly_metrics(wit_data, members=None, pkey="feature_id"):
+def monthly_metrics(
+    wit_data: pd.DataFrame,
+    output_path: Path,
+    members: Optional[List[Any]] = None,
+    pkey: str = "feature_id",
+) -> pd.DataFrame:
     """
     Computes monthly statistics for WIT members.
 
@@ -257,7 +328,7 @@ def monthly_metrics(wit_data, members=None, pkey="feature_id"):
     res.insert(1, "month", res["date"].dt.month)
     res.insert(1, "year", res["date"].dt.year)
 
-    out = config.OUTPUT_DIR / f"WIT_monthly_metrics{chunk}.parquet"
+    out = output_path / f"WIT_monthly_metrics{chunk}.parquet"
     write_batch_parquet(res, out)
     return res
 
@@ -267,7 +338,7 @@ def monthly_metrics(wit_data, members=None, pkey="feature_id"):
 # ------------------------------------------------------------------------------
 
 
-def _event_table(df, threshold):
+def _event_table(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     """
     Generates a table of inundation events and gaps based on a threshold.
 
@@ -379,13 +450,14 @@ def _event_table(df, threshold):
 
 
 def inundation_metrics(
-    wit_data,
-    threshold_df,
-    shapefile_path,
-    shapefile_key,
-    debug_event_times=False,
-    pkey="feature_id",
-):
+    wit_data: pd.DataFrame,
+    threshold_df: Union[pd.DataFrame, float],
+    shapefile_path: Path,
+    shapefile_key: str,
+    output_path: Path,
+    debug_event_times: bool = False,
+    pkey: str = "feature_id",
+) -> pd.DataFrame:
     """
     Calculates inundation metrics for each feature in the batch.
 
@@ -439,6 +511,14 @@ def inundation_metrics(
         event_df = _event_table(group_df, current_threshold)
         if event_df.empty:
             continue
+
+        # Ensure consistent dtypes to avoid FutureWarning in pd.concat
+        # None values cause the warning come from Leading Gaps—periods of dryness at the start of the record. 
+        # "Never Wet" Sites: The entire record is one big gap. start_date is None.
+        # Sites that Start Dry: If a site is dry for the first month and then floods, the code creates a "Leading Gap" row where start_date is None,
+        # this converts None to NaT (not a time) which is compatible with wet sites for concatenation
+        event_df["start_date"] = pd.to_datetime(event_df["start_date"])
+        event_df["end_date"] = pd.to_datetime(event_df["end_date"])
 
         # Add metadata
         event_df.insert(0, pkey, feature_id)
@@ -514,7 +594,7 @@ def inundation_metrics(
     event_df["end_date"] = pd.to_datetime(event_df["end_date"]).dt.date
 
     # Output management
-    out = config.OUTPUT_DIR / f"WIT_inundation_metrics{chunk}.parquet"
+    out = output_path / f"WIT_inundation_metrics{chunk}.parquet"
     write_batch_parquet(event_df, out)
 
     if debug_event_times and event_times:
@@ -522,13 +602,15 @@ def inundation_metrics(
         debug_df["start_date"] = pd.to_datetime(debug_df["start_date"]).dt.date
         debug_df["end_date"] = pd.to_datetime(debug_df["end_date"]).dt.date
         write_batch_parquet(
-            debug_df, config.OUTPUT_DIR / f"WIT_event_times{chunk}.parquet"
+            debug_df, output_path / f"WIT_event_times{chunk}.parquet"
         )
 
     return event_df
 
 
-def interpolate_daily(wit_data, pkey="feature_id"):
+def interpolate_daily(
+    wit_data: pd.DataFrame, pkey: str = "feature_id"
+) -> pd.DataFrame:
     """
     Interpolates WIT data to a daily frequency using a linear interpolation
 
@@ -571,7 +653,9 @@ def interpolate_daily(wit_data, pkey="feature_id"):
 # ------------------------------------------------------------------------------
 
 
-def time_since_last_inundation(wit_data, wit_im, pkey="feature_id"):
+def time_since_last_inundation(
+    wit_data: pd.DataFrame, wit_im: Optional[pd.DataFrame], output_path: Path, pkey: str = "feature_id"
+) -> pd.DataFrame:
     """
     Calculates time since last inundation using the 'Gap After' logic.
     """
@@ -599,20 +683,21 @@ def time_since_last_inundation(wit_data, wit_im, pkey="feature_id"):
 
     # 3. Save and return
     span["chunk"] = chunk
-    out = config.OUTPUT_DIR / f"WIT_time_since_last_inundation{chunk}.parquet"
+    out = output_path / f"WIT_time_since_last_inundation{chunk}.parquet"
     write_batch_parquet(span, out)
 
     return span
 
 
 def adaptive_inundation_threshold(
-    wit_data,
-    members=[["water", "wet"]],
-    pkey="feature_id",
-    threshold_percentile=0.3,
-    min_threshold=0.05,
-    max_threshold=0.5,
-):
+    wit_data: pd.DataFrame,
+    output_path: Path,
+    members: Optional[List[List[str]]] = None,
+    pkey: str = "feature_id",
+    threshold_percentile: float = 0.3,
+    min_threshold: float = 0.05,
+    max_threshold: float = 0.5,
+) -> pd.DataFrame:
     """
     Computes an adaptive inundation threshold for each feature.
 
@@ -630,6 +715,8 @@ def adaptive_inundation_threshold(
     Returns:
         pd.DataFrame: DataFrame indexed by pkey with the calculated threshold.
     """
+    if members is None:
+        members = [["water", "wet"]]
 
     chunk = int(wit_data["chunk"].iat[0])
 
@@ -652,28 +739,24 @@ def adaptive_inundation_threshold(
     # 4. Safety Logging
     total = len(threshold_df)
 
-    print(f"--- Chunk {chunk} Adaptive Threshold Summary ---")
-    print(f"Total features: {total}")
-    print(f"Using percentile {threshold_percentile}  for adaptive threshold.")
-    print(f"Ephemeral Floor ({min_threshold}) applied.")
-    print(f"Ephemeral Ceiling ({max_threshold}) applied.")
-    print("---------------------------------------")
+    logger.debug(f"Chunk {chunk} has {total} features. Adaptive inundation threshold {threshold_percentile}  with Floor ({min_threshold}) and Ceiling ({max_threshold}).")
 
     # 5. Save and Return
-    out_file = config.OUTPUT_DIR / f"WIT_event_threshold{chunk}.parquet"
+    out_file = output_path / f"WIT_event_threshold{chunk}.parquet"
     write_batch_parquet(threshold_df.reset_index(), out_file)
 
     return threshold_df
 
 
 def merge_batches(
-    path,
-    output_filenames,
-    tag="RESULT",
-    monthly_subset=["feature_id", "date", "water+wet_median"],
-    labels_df=None,
-    Labels_join_field="feature_id",
-):
+    path: Path,
+    output_filenames: List[str],
+    tag: str = "RESULT",
+    monthly_subset: Optional[List[str]] = None,
+    labels_df: Optional[pd.DataFrame] = None,
+    Labels_join_field: str = "feature_id",
+    zip_result: bool = False,
+) -> None:
     """
     Merges batch output files into single result files.
 
@@ -691,9 +774,9 @@ def merge_batches(
         out_files = list(path.glob(f"{fname}*.parquet"))
         if out_files:
             result_fname = f"{tag}{fname}.csv"
-            print(f"Merging {len(out_files)} batch outputs into {result_fname} ...")
+            logger.info(f"Merging {len(out_files)} batch outputs into {result_fname} ...")
             dfs = []
-            for out_file in tqdm(out_files):
+            for out_file in tqdm(out_files, ncols=160):
                 try:
                     df = pd.read_parquet(out_file)
                     if monthly_subset and "monthly" in fname:
@@ -723,23 +806,23 @@ def merge_batches(
                     try:
                         out_data = out_data.merge(labels_df, on=Labels_join_field)
                     except Exception as ex:
-                        print(f"Error merging labels: {ex}")
+                        logger.error(f"Error merging labels: {ex}")
                         raise
 
                 compression = None
-                if config.ZIP_RESULT:
+                if zip_result:
                     compression = {"method": "zip", "archive_name": result_fname}
-                    result_fname = f"{tag}{fname}.zip"
+                    result_fname = Path(result_fname).with_suffix(".zip")
                 try:
                     out_data.round(4).to_csv(
                         path / result_fname, index=False, compression=compression
                     )
                 except Exception as ex:
-                    print(f"Error writing merged file: {result_fname} - {ex}")
+                    logger.error(f"Error writing merged file: {result_fname} - {ex}")
                     raise
 
 
-def delete_old_batch_outputs(path, output_filenames):
+def delete_old_batch_outputs(path: Path, output_filenames: List[str]) -> None:
     """
     Deletes the individual batch results which are no longer required after they have been merged.
 
@@ -747,7 +830,6 @@ def delete_old_batch_outputs(path, output_filenames):
         path (pathlib.Path): Directory path.
         output_filenames (list): List of filename patterns to delete.
     """
-    path = Path(path)  # Ensure Path object
     deleted_count = 0
     error_count = 0
     for fname in output_filenames:
@@ -755,13 +837,16 @@ def delete_old_batch_outputs(path, output_filenames):
         for out_file in out_files:
             try:
                 out_file.unlink()
-            except:
-                print("Error while deleting file : ", out_file)
+                deleted_count += 1
+            except Exception as ex:
+                logger.error(f"Error deleting file: {out_file} - {ex}")
+                error_count += 1
+    if error_count > 0:
+        logger.warning(f"Failed to delete {error_count} batch outputs")
+    if deleted_count > 0:
+        logger.debug(f"Deleted {deleted_count} batch outputs")
 
 
-def nice_time(s):
-    """Formats seconds into a human-readable string."""
-    return time.strftime("%H hours %M minutes %S seconds", time.gmtime(s))
 
 
 # ------------------------------------------------------------------------------
@@ -769,7 +854,9 @@ def nice_time(s):
 # ------------------------------------------------------------------------------
 
 
-def load_batch(csv_files, chunk_id):
+def load_batch(
+    csv_files: List[Path], chunk_id: int, config: WITMetricsConfig
+) -> Optional[pd.DataFrame]:
     """
     Loads, cleans, and combines a batch of CSV files.
 
@@ -787,7 +874,7 @@ def load_batch(csv_files, chunk_id):
         pd.DataFrame: Processed DataFrame for the batch.
     """
     dfs = []
-    pkey = config.WIT_FEATURE_ID
+    pkey = config.wit_feature_id
 
     for f in csv_files:
         try:
@@ -803,7 +890,7 @@ def load_batch(csv_files, chunk_id):
             continue
 
         # 1. Filter missing data
-        df = df[df["pc_missing"] < config.PC_MISSING_THRESHOLD]
+        df = df[df["pc_missing"] < config.pc_missing_threshold]
         if df.empty:
             continue
 
@@ -837,7 +924,7 @@ def load_batch(csv_files, chunk_id):
     return wit_data
 
 
-def write_batch_parquet(batch_df, batch_fname):
+def write_batch_parquet(batch_df: pd.DataFrame, batch_fname: Path) -> Path:
     """
     Write a batch DataFrame to a temp Parquet file.
 
@@ -855,7 +942,7 @@ def write_batch_parquet(batch_df, batch_fname):
         batch_df.to_parquet(tmp_out, index=False)
 
         # Atomic rename
-        os.replace(tmp_out, batch_fname)
+        tmp_out.replace(batch_fname)
 
         logger.info(f"  Written batch output:  {batch_fname}")
 
@@ -872,7 +959,9 @@ def write_batch_parquet(batch_df, batch_fname):
 # ------------------------------------------------------------------------------
 
 
-def process_batch(csv_files, chunk_id):
+def process_batch(
+    csv_files: List[Path], chunk_id: int, config: WITMetricsConfig
+) -> None:
     """
     Orchestrates the processing of a single batch of files.
 
@@ -888,36 +977,37 @@ def process_batch(csv_files, chunk_id):
     """
     # 1. Load, Normalize, and Sort
     # Handles daily averaging and strips time components immediately
-    wit_data = load_batch(csv_files, chunk_id)
+    wit_data = load_batch(csv_files, chunk_id, config)
 
     if wit_data is None or wit_data.empty:
         return
 
     # 2. Optional daily interpolation
     # Fills gaps between observations using linear interpolation
-    if config.INTERPOLATE_TO_DAILY:
+    if config.interpolate_to_daily:
         wit_data = interpolate_daily(wit_data)
 
-        if config.SAVE_INTERPOLATED_CSV:
+        if config.save_interpolated_csv:
             # Note: This can be slow for very large batches
-            out_dir = config.OUTPUT_DIR / "csv_daily_interpolated"
-            os.makedirs(out_dir, exist_ok=True)
+            out_path = config.output_path / "csv_daily_interpolated"
+            out_path.mkdir(parents=True, exist_ok=True)
             # Efficiently save grouped CSVs
-            for fid, group in wit_data.groupby(config.WIT_FEATURE_ID, sort=False):
-                group.to_csv(out_dir / f"{fid}.csv", index=False)
+            for fid, group in wit_data.groupby(config.wit_feature_id, sort=False):
+                group.to_csv(out_path / f"{fid}.csv", index=False)
 
     # 3. Monthly & Annual Metrics
     # Uses the single-pass _resample_metrics for high speed
-    monthly_metrics(wit_data)
-    annual_metrics(wit_data)
+    monthly_metrics(wit_data, config.output_path)
+    annual_metrics(wit_data, config.output_path)
 
     # 4. Inundation threshold (All-time median)
     # Calculates the threshold used for event detection
     median_df = adaptive_inundation_threshold(
         wit_data,
-        threshold_percentile=config.THRESHOLD_PERCENTILE,
-        min_threshold=config.MIN_THRESHOLD,
-        max_threshold=config.MAX_THRESHOLD,
+        config.output_path,
+        threshold_percentile=config.threshold_percentile,
+        min_threshold=config.min_threshold,
+        max_threshold=config.max_threshold,
     )
     # Extract the specific column needed for _event_table
     threshold_df = pd.DataFrame(median_df["water+wet"])
@@ -927,117 +1017,23 @@ def process_batch(csv_files, chunk_id):
     wit_inundation_events_df = inundation_metrics(
         wit_data,
         threshold_df=threshold_df,
-        shapefile_path=config.SHAPEFILE_PATH,
-        shapefile_key=config.SHAPEFILE_KEY,
-        debug_event_times=config.DEBUG_EVENT_TIMES,
+        shapefile_path=config.shapefile_path,
+        shapefile_key=config.shapefile_key,
+        output_path=config.output_path,
+        debug_event_times=config.debug_event_times,
     )
 
     # 6. Time Since Last Inundation
     # Uses wit_data and the newly created wit_im to find the final dry gap
-    time_since_last_inundation(wit_data, wit_inundation_events_df)
+    time_since_last_inundation(wit_data, wit_inundation_events_df, config.output_path)
 
 
-# ------------------------------------------------------------------------------
-# Config validation
-# ------------------------------------------------------------------------------
+def main() -> None:
+    config:WITMetricsConfig = load_config("wit_metrics")
+    validate_config(config)
+    setup_logging(config.log_path, __name__)
 
 
-def validate_config():
-    """
-    Validates configuration before processing starts.
-    Catches issues early rather than failing hours into a batch job.
-    """
-    errors = []
-    warnings = []
-
-    # 1. Check critical paths exist
-    if not config.WIT_CSV_PATH.exists():
-        errors.append(f"WIT_CSV_PATH does not exist: {config.WIT_CSV_PATH}")
-
-    if not config.WIT_CSV_PATH.is_dir():
-        errors.append(f"WIT_CSV_PATH is not a directory: {config.WIT_CSV_PATH}")
-
-    # Check if shapefile exists (only if area lookup is enabled)
-    if config.SHAPEFILE_PATH and config.SHAPEFILE_PATH != Path(""):
-        if not config.SHAPEFILE_PATH.exists():
-            errors.append(f"SHAPEFILE_PATH does not exist: {config.SHAPEFILE_PATH}")
-        elif not config.SHAPEFILE_PATH.suffix == ".shp":
-            warnings.append(
-                f"SHAPEFILE_PATH doesn't have .shp extension: {config.SHAPEFILE_PATH}"
-            )
-
-    # Check value ranges
-    if not 0 <= config.PC_MISSING_THRESHOLD <= 1:
-        errors.append(
-            f"PC_MISSING_THRESHOLD must be between 0 and 1, got: {config.PC_MISSING_THRESHOLD}"
-        )
-
-    if config.BATCH_SIZE < 1:
-        errors.append(f"BATCH_SIZE must be >= 1, got: {config.BATCH_SIZE}")
-        
-    if config.THRESHOLD_PERCENTILE < 0 or config.THRESHOLD_PERCENTILE > 1:
-        errors.append(
-            f"THRESHOLD_PERCENTILE must be between 0 and 1 (0.3 recommended), got: {config.THRESHOLD_PERCENTILE}"
-        )
-
-    if config.MIN_THRESHOLD < 0 or config.MIN_THRESHOLD > 1:
-        errors.append(
-            f"MIN_THRESHOLD must be between 0 and 1 (0.05 recommended), got: {config.MIN_THRESHOLD}"
-        )
-
-    if config.MAX_THRESHOLD < 0 or config.MAX_THRESHOLD > 1:
-        errors.append(
-            f"MAX_THRESHOLD must be between 0 and 1 (0.5 recommended), got: {config.MAX_THRESHOLD}"
-        )
-
-    # Check MONTHLY_SUBSET validity
-    if config.MONTHLY_SUBSET is not None:
-        required_cols = ["feature_id", "date"]
-        missing = [col for col in required_cols if col not in config.MONTHLY_SUBSET]
-        if missing:
-            errors.append(
-                f"MONTHLY_SUBSET must include {required_cols}, missing: {missing}"
-            )
-
-        # Should have at least one metric column
-        if len(config.MONTHLY_SUBSET) <= 2:
-            warnings.append(
-                "MONTHLY_SUBSET only has feature_id and date - no metrics selected"
-            )
-
-    # Try to create output directories
-    try:
-        config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        if not os.access(config.OUTPUT_DIR, os.W_OK):
-            errors.append(f"OUTPUT_DIR is not writable: {config.OUTPUT_DIR}")
-    except Exception as e:
-        errors.append(f"Cannot create OUTPUT_DIR {config.OUTPUT_DIR}: {e}")
-
-    # Report results
-    if warnings:
-        for w in warnings:
-            logger.warning(f"Config warning: {w}")
-
-    if errors:
-        error_msg = "Configuration validation failed:\n" + "\n".join(
-            f"  - {e}" for e in errors
-        )
-        raise ValueError(error_msg)
-
-    logger.info("Configuration validated successfully")
-
-    # Log key settings
-    logger.info(f"Processing settings:")
-    logger.info(f"  Input: {config.WIT_CSV_PATH}")
-    logger.info(f"  Output: {config.OUTPUT_DIR}")
-    logger.info(f"  Interpolate to daily: {config.INTERPOLATE_TO_DAILY}")
-    logger.info(f"  Batch size: {config.BATCH_SIZE}")
-    logger.info(f"  Missing threshold: {config.PC_MISSING_THRESHOLD}")
-
-
-if __name__ == "__main__":
-
-    validate_config()
 
     output_filenames = [
         "WIT_yearly_metrics",
@@ -1047,48 +1043,53 @@ if __name__ == "__main__":
         "WIT_event_times",
         "WIT_event_stats",
     ]
-
-    if config.INTERPOLATE_TO_DAILY:
+    if config.interpolate_to_daily:
         output_filenames.append("WIT_monthly_metrics")
 
-    # Cleanup old batch outputs
-    delete_old_batch_outputs(config.OUTPUT_DIR, output_filenames)
+    csv_list = list(config.wit_csv_path.glob("*.csv"))
+    total_csv_files = len(csv_list)
 
-    csv_list = list(config.WIT_CSV_PATH.glob("*.csv"))
-    total_files = len(csv_list)
+    if total_csv_files == 0:
+        RuntimeError(f"No CSV files found in {config.wit_csv_path}")
+        return
+    
+    # create output directory
+    try:
+        config.output_path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise RuntimeError(f"Cannot create output_path {config.output_path}: {e}")
+    
+    # Cleanup any old batch outputs from prior runs
+    delete_old_batch_outputs(config.output_path, output_filenames)
 
-    if total_files == 0:
-        raise RuntimeError(f"No CSV files found in {config.WIT_CSV_PATH}")
-
-    # Conservative core usage (important for IO-bound workloads)
+    # Conservative core usage (limits IO and memory pressure reading many csv)
     CPU = max(1, multiprocessing.cpu_count() // 2)
-
-    batch_size = config.BATCH_SIZE
+    batch_size = config.batch_size
     chunk_size = batch_size * CPU
 
-    print(f"Processing with {CPU} worker processes")
-    print(f"Found {total_files} WIT CSV files")
-    print(f"Batch size per process: {batch_size}")
+    logger.info(f"Processing with {CPU} worker processes")
+    logger.info(f"Found {total_csv_files} WIT CSV files")
+    logger.info(f"Batch size per process: {batch_size}")
 
     start = time.process_time()
 
     # ------------------------------------------------------------------
     # Batch-level multiprocessing only
     # ------------------------------------------------------------------
-    for j in tqdm(range(0, total_files, chunk_size), desc=f"Processing chunks"):
-        mpbatch = csv_list[j : j + chunk_size]
+    for j in tqdm(range(0, total_csv_files, chunk_size), desc=f"Processing chunks", ncols=160):
+        mp_batch = csv_list[j : j + chunk_size]
 
         work = []
-        for i in range(0, len(mpbatch), batch_size):
-            batch_files = mpbatch[i : i + batch_size]
+        for i in range(0, len(mp_batch), batch_size):
+            batch_files = mp_batch[i : i + batch_size]
             chunk_id = j + i
-            work.append((batch_files, chunk_id))
+            work.append((batch_files, chunk_id, config))
 
         with multiprocessing.Pool(processes=min(len(work), CPU)) as pool:
             pool.starmap(process_batch, work)
 
-    print(
-        f"{total_files} CSVs processed in "
+    logger.info(
+        f"{total_csv_files} CSVs processed in "
         f"{time.strftime('%H:%M:%S', time.gmtime(time.process_time() - start))}"
     )
 
@@ -1096,13 +1097,20 @@ if __name__ == "__main__":
     # Merge batch outputs
     # ------------------------------------------------------------------
     merge_batches(
-        config.OUTPUT_DIR,
+        config.output_path,
         output_filenames,
-        monthly_subset=config.MONTHLY_SUBSET,
-        tag=config.TAG,
+        monthly_subset=config.monthly_subset,
+        tag=config.tag,
+        zip_result=config.zip_result,
     )
 
-    print("All batches merged successfully.")
+    logger.info("All batches merged successfully.")
 
-    # Optional cleanup
-    delete_old_batch_outputs(config.OUTPUT_DIR, output_filenames)
+    # cleanup intermediate files
+    delete_old_batch_outputs(config.output_path, output_filenames)
+
+
+
+if __name__ == "__main__":
+
+    main()
