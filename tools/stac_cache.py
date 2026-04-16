@@ -21,7 +21,7 @@ import hashlib
 import json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import OrderedDict
+from collections import defaultdict, OrderedDict
 from functools import wraps
 import pystac
 from inspect import signature
@@ -1041,16 +1041,39 @@ class STACCache:
                         pass
         if count > 0:
             logger.info(f"Cleaned up {count} stale .tmp files")
+            
+    def cleanup_old_files(cache_root, max_age_days=90):
+        """
+        Remove files older than max_age_days.
+        
+        With noatime: This removes files by download age, not access age.
+        Good enough for: "Delete anything downloaded >90 days ago"
+        """
+        cutoff = time.time() - (max_age_days * 86400)
+        
+        deleted = 0
+        for filepath in cache_root.rglob("*.tif"):
+            if filepath.stat().st_mtime < cutoff:
+                try:
+                    filepath.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+        
+        return deleted
 
     def info(self):
-        """Diagnostics: disk, cache footprint, file age & size distributions, transient file hygiene, collection breakdown."""
+        """
+        Diagnostics: Parallelized for NAS performance.
+        Calculates disk usage, cache footprint, age distribution, and collection breakdown.
+        """
         print(f"\n--- Cache Info: {self.cache_root} ---")
 
         if not self.cache_root.exists():
             print("Cache directory does not exist.")
             return
 
-        # Disk health
+        # 1. Disk health (Fast, single syscall)
         try:
             total, used, free = shutil.disk_usage(self.cache_root)
             print(
@@ -1061,122 +1084,194 @@ class STACCache:
         except Exception as e:
             print(f"Disk usage check failed: {e}")
 
-        # Collect files
-        all_files = [
-            Path(root) / f
-            for root, _, files in os.walk(self.cache_root)
-            for f in files
-        ]
         now = time.time()
-
-        def stat_worker(path):
-            try:
-                st = path.stat()
-                return {
-                    "path": path,
-                    "size": st.st_size,
-                    "mtime": st.st_mtime,
-                    "lock": path.name.endswith(".lock"),
-                    "tmp": path.name.endswith(".tmp"),
-                }
-            except OSError:
-                return None
+        
+        # 2. Define the worker function for parallel execution
+        def _scan_chunk(start_path):
+            """
+            Scans a directory tree serially and returns aggregated stats.
+            This runs inside a thread.
+            """
+            local_stats = {
+                "age_buckets": defaultdict(int),
+                "transient_counts": defaultdict(int),
+                "transient_ages": [],
+                "collections": defaultdict(int),
+                "unclassified_files": 0,
+                "total_files": 0,
+                "total_bytes": 0,
+            }
             
-        if self._executor and not self._executor._shutdown:
-            # Use parallel processing
-            stats = []
-            futures = {self._executor.submit(stat_worker, f): f for f in all_files}
-            for fut in as_completed(futures):
-                res = fut.result()
-                if res:
-                    stats.append(res)
-        else:
-            # Serial fallback if executor shut down
-            stats = []
-            for f in all_files:
-                res = stat_worker(f)
-                if res:
-                    stats.append(res)  
+            # Stack-based iteration to avoid recursion limits on deep trees
+            stack = [start_path]
             
-
-        stats = []
-        futures = {self._executor.submit(stat_worker, f): f for f in all_files}
-        for fut in as_completed(futures):
-            res = fut.result()
-            if res:
-                stats.append(res)
-
-        # Accumulators
-        age_buckets = {"<7d": 0, "7-30d": 0, "1-6mo": 0, ">6mo": 0}
-        transient_counts = {"lock": 0, "tmp": 0}
-        transient_ages = []
-        collections = {}
-        unclassified_files = 0
-        total_files = 0
-        total_bytes = 0
-
-        for s in stats:
-            p = s["path"]
-            file_size = s["size"]
-            mtime = s["mtime"]
-
-            if s["lock"]:
-                transient_counts["lock"] += 1
-                continue
-            if s["tmp"]:
-                transient_counts["tmp"] += 1
-                transient_ages.append(now - mtime)
-                continue
-
-            age_days = (now - mtime) / 86400
-            if age_days < 7:
-                age_buckets["<7d"] += 1
-            elif age_days < 30:
-                age_buckets["7-30d"] += 1
-            elif age_days < 180:
-                age_buckets["1-6mo"] += 1
-            else:
-                age_buckets[">6mo"] += 1
-
-            total_files += 1
-            total_bytes += file_size
-
-            # Collection classification by path structure
-            rel_path = p.relative_to(self.cache_root)
-            parts = rel_path.parts
-            col_name = "Unclassified"
-            if "baseline" in parts:
+            while stack:
+                current_path = stack.pop()
                 try:
-                    idx = parts.index("baseline")
-                    if idx + 1 < len(parts):
-                        col_name = parts[idx + 1]
-                except ValueError:
+                    # os.scandir is much faster on NAS than os.walk or Path.glob
+                    with os.scandir(current_path) as it:
+                        for entry in it:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                                continue
+                            
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+
+                            # On Linux/Windows, entry.stat() is usually cached from scandir
+                            try:
+                                st = entry.stat()
+                                size = st.st_size
+                                mtime = st.st_mtime
+                                name = entry.name
+                            except OSError:
+                                continue
+
+                            # --- Aggregation Logic ---
+                            local_stats["total_files"] += 1
+                            local_stats["total_bytes"] += size
+
+                            # Transient checks
+                            if name.endswith(".lock"):
+                                local_stats["transient_counts"]["lock"] += 1
+                                continue
+                            if name.endswith(".tmp"):
+                                local_stats["transient_counts"]["tmp"] += 1
+                                local_stats["transient_ages"].append(now - mtime)
+                                continue
+
+                            # Age buckets
+                            age_days = (now - mtime) / 86400
+                            if age_days < 7:
+                                local_stats["age_buckets"]["<7d"] += 1
+                            elif age_days < 30:
+                                local_stats["age_buckets"]["7-30d"] += 1
+                            elif age_days < 180:
+                                local_stats["age_buckets"]["1-6mo"] += 1
+                            else:
+                                local_stats["age_buckets"][">6mo"] += 1
+
+                            # Collection classification (Optimized string parsing)
+                            # Path: .../baseline/COLLECTION_NAME/...
+                            try:
+                                path_str = entry.path
+                                if "baseline" in path_str:
+                                    # Fast string splitting
+                                    parts = path_str.split(os.sep)
+                                    if "baseline" in parts:
+                                        idx = parts.index("baseline")
+                                        if idx + 1 < len(parts):
+                                            col = parts[idx + 1]
+                                            local_stats["collections"][col] += size
+                                            continue
+                                local_stats["unclassified_files"] += 1
+                            except Exception:
+                                local_stats["unclassified_files"] += 1
+
+                except OSError:
+                    # Permission denied or path disappeared
                     pass
-            else:
-                unclassified_files += 1
+            
+            return local_stats
 
-            collections[col_name] = collections.get(col_name, 0) + file_size
+        # 3. Prepare Work Chunks
+        # Drill down to find enough distinct subdirectories to parallelize effectively.
+        # We aim to split until we have enough chunks to saturate threads, or hit a specific depth.
+        scan_targets = [self.cache_root]
+        target_chunk_count = 64  # Aim for plenty of chunks (4x workers) to balance load
+        max_split_depth = 4      # User indicated structure becomes meaningful at level 3
 
-        # Print summary
-        print(f"\nCache: {total_bytes / (1 << 30):.2f} GB, {total_files} files")
-        print("File age distribution:", age_buckets)
+        print("Discovering scan targets...")
+        
+        current_depth = 0
+        while current_depth < max_split_depth and len(scan_targets) < target_chunk_count:
+            next_targets = []
+            expanded_any = False
+            
+            for path in scan_targets:
+                try:
+                    # We only care about directories for splitting work
+                    is_leaf = True
+                    with os.scandir(path) as it:
+                        for entry in it:
+                            if entry.is_dir(follow_symlinks=False):
+                                next_targets.append(entry.path)
+                                is_leaf = False
+                                expanded_any = True
+                    
+                    # If no subdirectories found, this path is a work unit (leaf or files-only)
+                    if is_leaf:
+                        next_targets.append(path)
+                        
+                except OSError:
+                    # If we can't read it now, keep it so the worker logs the error
+                    next_targets.append(path)
+            
+            if not expanded_any:
+                break
+                
+            scan_targets = next_targets
+            current_depth += 1
+            
+        print(f"Identified {len(scan_targets)} scan targets at depth {current_depth}.")
+
+        # 4. Execute Parallel Scan
+        # 16-32 workers is usually the sweet spot for NAS latency hiding.
+        # Too many will thrash the disk I/O; too few won't hide network latency.
+        final_stats = {
+            "age_buckets": defaultdict(int),
+            "transient_counts": defaultdict(int),
+            "transient_ages": [],
+            "collections": defaultdict(int),
+            "unclassified_files": 0,
+            "total_files": 0,
+            "total_bytes": 0,
+        }
+
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            future_to_path = {executor.submit(_scan_chunk, p): p for p in scan_targets}
+            
+            for future in as_completed(future_to_path):
+                try:
+                    data = future.result()
+                    # Merge results
+                    final_stats["total_files"] += data["total_files"]
+                    final_stats["total_bytes"] += data["total_bytes"]
+                    final_stats["unclassified_files"] += data["unclassified_files"]
+                    final_stats["transient_ages"].extend(data["transient_ages"])
+                    
+                    for k, v in data["age_buckets"].items():
+                        final_stats["age_buckets"][k] += v
+                    for k, v in data["transient_counts"].items():
+                        final_stats["transient_counts"][k] += v
+                    for k, v in data["collections"].items():
+                        final_stats["collections"][k] += v
+                        
+                except Exception as exc:
+                    print(f"Worker failed: {exc}")
+
+        # 5. Print Summary
+        print(f"\nCache: {final_stats['total_bytes'] / (1 << 30):.2f} GB, {final_stats['total_files']} files")
+        print("File age distribution:", dict(final_stats["age_buckets"]))
         print("Collection footprint (GB):")
-        for col, sz in sorted(collections.items()):
+        
+        for col, sz in sorted(final_stats["collections"].items(), key=lambda x: x[1], reverse=True):
             print(f"  {col}: {sz / (1 << 30):.2f}")
 
-        oldest_tmp = max(transient_ages) if transient_ages else 0
+        oldest_tmp = max(final_stats["transient_ages"]) if final_stats["transient_ages"] else 0
         oldest_str = (
             f"{int(oldest_tmp // 3600)}h {int((oldest_tmp % 3600) // 60)}m"
             if oldest_tmp
             else "N/A"
         )
         print(
-            f"Transient files: Lock={transient_counts['lock']}, "
-            f"Temp={transient_counts['tmp']} (oldest {oldest_str})"
+            f"Transient files: Lock={final_stats['transient_counts']['lock']}, "
+            f"Temp={final_stats['transient_counts']['tmp']} (oldest {oldest_str})"
         )
-        if unclassified_files:
-            print(f"Unclassified files: {unclassified_files}")
+        if final_stats["unclassified_files"]:
+            print(f"Unclassified files: {final_stats['unclassified_files']}")
         print("-----------------------------------")
+
 
     def cache_search(self, func):
         """

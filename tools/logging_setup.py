@@ -47,4 +47,3 @@ def setup_logging(log_dir, script_name, file_level=logging.DEBUG, console_level=
 
     logging.info(f"Logging to: {log_file}")
 
-    return log_file
