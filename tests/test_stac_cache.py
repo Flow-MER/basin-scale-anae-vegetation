@@ -4,8 +4,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # Add project root to sys.path to allow imports from tools/
-current_dir = Path(__file__).resolve().parent
-project_root = current_dir.parent
+current_path = Path(__file__).resolve().parent
+project_root = current_path.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 

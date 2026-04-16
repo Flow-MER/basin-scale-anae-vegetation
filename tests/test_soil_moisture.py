@@ -9,12 +9,6 @@ import numpy as np
 from pathlib import Path
 import dask
 
-# Add project root to sys.path to allow imports
-current_dir = Path(__file__).resolve().parent
-project_root = current_dir.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
 from data_pipelines.soil_moisture_monthly_awo import (
     get_parquet_filename,
     get_existing_months,
@@ -22,24 +16,26 @@ from data_pipelines.soil_moisture_monthly_awo import (
     download_mdb_soilmoisture_subset,
     process_polygon_block_lazy,
     write_month_parquet,
-    aggregate_parquets
+    aggregate_monthly_results,
 )
 
 @pytest.fixture
 def mock_config(tmp_path):
     """Mock configuration object with temporary paths."""
-    with patch("data_pipelines.soil_moisture_monthly_awo.config") as mock_cfg:
-        mock_cfg.OUTPUT_DIR = tmp_path / "output"
-        mock_cfg.CACHE_DIR = tmp_path / "cache"
-        mock_cfg.POLYGON_PATH = tmp_path / "polygons.shp"
-        mock_cfg.LOCAL_ROOT_ZONE_SOIL_MOISTURE_RELATIVE_NETCDF_PATH = tmp_path / "sm.nc"
-        mock_cfg.THREDDS_AWO_ROOT_ZONE_SOIL_MOISTURE_BASE_URL = "http://mock.url"
-        mock_cfg.POLY_UNIQUE_ID = "UID"
-        mock_cfg.SM_VAR = "sm_pct"
-        mock_cfg.CRS_FALLBACK = "EPSG:4326"
-        mock_cfg.START_DATE = "2020-01-01"
-        mock_cfg.END_DATE = "2020-12-31"
-        yield mock_cfg
+    mock_cfg = MagicMock()
+    mock_cfg.output_path = tmp_path / "output"
+    mock_cfg.shapefile_path = tmp_path / "polygons.shp"
+    mock_cfg.local_root_zone_soil_moisture_relative_netcdf_path = tmp_path / "sm.nc"
+    mock_cfg.thredds_awo_root_zone_soil_moisture_base_url = "http://mock.url"
+    mock_cfg.poly_unique_id = "UID"
+    mock_cfg.sm_var = "sm_pct"
+    mock_cfg.crs_fallback = "EPSG:4326"
+    mock_cfg.start_date = "2020-01-01"
+    mock_cfg.end_date = "2020-12-31"
+    mock_cfg.block_size = 100
+    mock_cfg.batch_size = 10
+    mock_cfg.dask_n_workers_override = 1
+    return mock_cfg
 
 @pytest.fixture
 def sample_gdf():
@@ -65,9 +61,9 @@ def sample_raster():
     return da
 
 def test_get_parquet_filename(tmp_path):
-    out_dir = tmp_path / "cache"
-    fname = get_parquet_filename(out_dir, 2020, 1)
-    assert fname == out_dir / "soil_moisture_2020_01.parquet"
+    out_path = tmp_path / "cache"
+    fname = get_parquet_filename(out_path, 2020, 1)
+    assert fname == out_path / "soil_moisture_2020_01.parquet"
 
 def test_get_existing_months(tmp_path):
     (tmp_path / "soil_moisture_2020_01.parquet").touch()
@@ -92,29 +88,25 @@ def test_get_ncss_time_range(mock_get):
 @patch("requests.get")
 def test_download_mdb_soilmoisture_subset(mock_get, mock_time_range, mock_config, sample_gdf):
     # Setup
-    mock_config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    mock_config.output_path.mkdir(parents=True, exist_ok=True)
     mock_time_range.return_value = "2023-12-01"
-    
+
     # Mock response
     mock_response = MagicMock()
     mock_response.iter_content.return_value = [b"data_chunk"]
     mock_response.status_code = 200
     mock_get.return_value = mock_response
-    
+
     # Ensure local file does not exist
-    if mock_config.LOCAL_ROOT_ZONE_SOIL_MOISTURE_RELATIVE_NETCDF_PATH.exists():
-        mock_config.LOCAL_ROOT_ZONE_SOIL_MOISTURE_RELATIVE_NETCDF_PATH.unlink()
-        
+    if mock_config.local_root_zone_soil_moisture_relative_netcdf_path.exists():
+        mock_config.local_root_zone_soil_moisture_relative_netcdf_path.unlink()
+
     download_mdb_soilmoisture_subset(
-        mock_config.POLYGON_PATH,
-        mock_config.LOCAL_ROOT_ZONE_SOIL_MOISTURE_RELATIVE_NETCDF_PATH,
-        "2020-01-01",
-        mock_config.CACHE_DIR,
+        mock_config,
         gdf=sample_gdf,
-        unique_id="UID"
     )
-    
-    assert mock_config.LOCAL_ROOT_ZONE_SOIL_MOISTURE_RELATIVE_NETCDF_PATH.exists()
+
+    assert mock_config.local_root_zone_soil_moisture_relative_netcdf_path.exists()
     assert mock_get.called
 
 @patch("data_pipelines.soil_moisture_monthly_awo.exact_extract")
@@ -135,41 +127,47 @@ def test_process_polygon_block_lazy(mock_ee, sample_raster, sample_gdf):
     assert result[2][0] == ("A", 0.5)
 
 def test_write_month_parquet(tmp_path):
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    
+    cache_path = tmp_path / "cache"
+    cache_path.mkdir()
+
     month_results = [
         (2020, 1, [("A", 0.1), ("B", 0.2)]),
         (2020, 1, [("C", 0.3)])
     ]
-    
-    task = write_month_parquet(month_results, cache_dir, "sm_pct", "UID")
+
+    task = write_month_parquet(month_results, cache_path, "sm_pct", "UID")
     path = dask.compute(task, scheduler="sync")[0]
-    
+
     assert Path(path).exists()
     df = pd.read_parquet(path)
     assert len(df) == 3
     assert df.iloc[0]["year"] == 2020
     assert "sm_pct" in df.columns
 
-def test_aggregate_parquets(tmp_path):
-    cache_dir = tmp_path / "cache"
-    output_dir = tmp_path / "output"
-    cache_dir.mkdir()
-    output_dir.mkdir()
-    
+
+def test_aggregate_parquets(mock_config):
+    cache_path = mock_config.output_path / "cache"
+    output_path = mock_config.output_path
+    cache_path.mkdir(parents=True, exist_ok=True)
+    output_path.mkdir(parents=True, exist_ok=True)
+
     # Create dummy parquets
-    pd.DataFrame({"UID": ["A"], "sm_pct": [0.1], "year": [2020], "month": [1]}).to_parquet(cache_dir / "soil_moisture_2020_01.parquet")
-    pd.DataFrame({"UID": ["A"], "sm_pct": [0.2], "year": [2021], "month": [1]}).to_parquet(cache_dir / "soil_moisture_2021_01.parquet")
-    
-    aggregate_parquets(cache_dir, output_dir, "UID", "sm_pct")
-    
-    zip_file = output_dir / "soil_moisture_2020_2029.zip"
+    pd.DataFrame(
+        {"UID": ["A"], "sm_pct": [0.1], "year": [2020], "month": [1]}
+    ).to_parquet(cache_path / "soil_moisture_2020_01.parquet")
+    pd.DataFrame(
+        {"UID": ["A"], "sm_pct": [0.2], "year": [2021], "month": [1]}
+    ).to_parquet(cache_path / "soil_moisture_2021_01.parquet")
+
+    aggregate_monthly_results(cache_path, output_path, "sm_pct", "UID")
+
+    zip_file = output_path / "soil_moisture_2020_2029.zip"
     assert zip_file.exists()
-    
+
     df = pd.read_csv(zip_file)
     assert len(df) == 2
     assert 2020 in df["year"].values
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", __file__]))
