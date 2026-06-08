@@ -15,17 +15,19 @@ you edit config.py before executing wit_metrics_worker.py
 
 """
 
+import logging
+import multiprocessing
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+
+import fiona
 import numpy as np
 import pandas as pd
-import fiona
 from shapely import geometry
-from pathlib import Path
 from tqdm import tqdm
-import time
-import multiprocessing
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
-import logging
-import sys
+
 # Add project root to sys.path to allow imports from config.py and tools/
 # This handles cases where the script is moved to a subfolder (e.g., input_pipelines/)
 current_path = Path(__file__).resolve().parent
@@ -35,9 +37,8 @@ else:
     project_root = current_path.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+from config import load_config
 from tools.logging_setup import setup_logging
-
-from config import WITMetricsConfig, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,8 @@ logger = logging.getLogger(__name__)
 # validate inputs
 # ------------------------------------------------------------------------------
 
-def validate_config(config: WITMetricsConfig) -> None:
+
+def validate_config(config) -> None:
     """
     Validates configuration before processing starts.
     Catches issues early rather than failing hours into a batch job.
@@ -62,9 +64,7 @@ def validate_config(config: WITMetricsConfig) -> None:
         if not config.shapefile_path.exists():
             errors.append(f"shapefile_path does not exist: {config.shapefile_path}")
         if not config.shapefile_path.suffix == ".shp":
-            warnings.append(
-                f"shapefile_path doesn't have .shp extension: {config.shapefile_path}"
-            )
+            warnings.append(f"shapefile_path doesn't have .shp extension: {config.shapefile_path}")
 
     # Check value ranges
     if not 0 <= config.pc_missing_threshold <= 1:
@@ -105,14 +105,14 @@ def validate_config(config: WITMetricsConfig) -> None:
             logger.warning(f"Config warning: {w}")
 
     if errors:
-        error_msg = "Configuration validation failed:\n" + "\n".join(
-            f"  - {e}" for e in errors
-        )
+        error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
         raise ValueError(error_msg)
+
 
 # ------------------------------------------------------------------------------
 # Geometry helpers
 # ------------------------------------------------------------------------------
+
 
 def shape_list(
     key: str, values: Iterable, shapefile: Union[str, Path]
@@ -136,9 +136,7 @@ def shape_list(
                 yield k, feat
 
 
-def get_areas(
-    polygons: Iterable[Tuple[Any, Dict[str, Any]]], pkey: str
-) -> Optional[pd.DataFrame]:
+def get_areas(polygons: Iterable[Tuple[Any, Dict[str, Any]]], pkey: str) -> Optional[pd.DataFrame]:
     """
     Calculates the area of each feature in hectares.
 
@@ -265,9 +263,7 @@ def annual_metrics(
 
     # 1. Create a local copy to avoid side-effects on the main wit_data
     # Use errors='ignore' in case columns were already dropped by monthly_metrics
-    df = wit_data.drop(columns=["chunk", "pc_missing"], errors="ignore").set_index(
-        "date"
-    )
+    df = wit_data.drop(columns=["chunk", "pc_missing"], errors="ignore").set_index("date")
 
     # 2. Add composite columns (e.g., water+wet)
     df = _add_combined_members(df, members)
@@ -316,9 +312,7 @@ def monthly_metrics(
     ]
 
     # Drop non-essential columns and set date as index for resampling
-    df = wit_data.drop(columns=["chunk", "pc_missing"], errors="ignore").set_index(
-        "date"
-    )
+    df = wit_data.drop(columns=["chunk", "pc_missing"], errors="ignore").set_index("date")
     df = _add_combined_members(df, members)
 
     # Use the optimized resampler
@@ -358,9 +352,7 @@ def _event_table(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     """
     df = df.sort_values("date").reset_index(drop=True)
     if df.empty:
-        return pd.DataFrame(
-            columns=["start_date", "end_date", "duration", "gap", "area_days"]
-        )
+        return pd.DataFrame(columns=["start_date", "end_date", "duration", "gap", "area_days"])
 
     record_start = df["date"].min()
     record_end = df["date"].max()
@@ -499,9 +491,7 @@ def inundation_metrics(
         if isinstance(threshold_df, pd.DataFrame):
             # Use 'water+wet' if it exists, otherwise the first numeric column
             thresh_col = (
-                "water+wet"
-                if "water+wet" in threshold_df.columns
-                else threshold_df.columns[0]
+                "water+wet" if "water+wet" in threshold_df.columns else threshold_df.columns[0]
             )
             current_threshold = threshold_df.loc[feature_id, thresh_col]
         else:
@@ -513,7 +503,7 @@ def inundation_metrics(
             continue
 
         # Ensure consistent dtypes to avoid FutureWarning in pd.concat
-        # None values cause the warning come from Leading Gaps—periods of dryness at the start of the record. 
+        # None values cause the warning come from Leading Gaps—periods of dryness at the start of the record.
         # "Never Wet" Sites: The entire record is one big gap. start_date is None.
         # Sites that Start Dry: If a site is dry for the first month and then floods, the code creates a "Leading Gap" row where start_date is None,
         # this converts None to NaT (not a time) which is compatible with wet sites for concatenation
@@ -527,9 +517,7 @@ def inundation_metrics(
 
         if debug_event_times:
             event_times.append(
-                event_df[
-                    [pkey, "threshold", "start_date", "end_date", "duration", "gap"]
-                ]
+                event_df[[pkey, "threshold", "start_date", "end_date", "duration", "gap"]]
             )
 
         # Compute water metrics
@@ -601,16 +589,12 @@ def inundation_metrics(
         debug_df = pd.concat(event_times, ignore_index=True)
         debug_df["start_date"] = pd.to_datetime(debug_df["start_date"]).dt.date
         debug_df["end_date"] = pd.to_datetime(debug_df["end_date"]).dt.date
-        write_batch_parquet(
-            debug_df, output_path / f"WIT_event_times{chunk}.parquet"
-        )
+        write_batch_parquet(debug_df, output_path / f"WIT_event_times{chunk}.parquet")
 
     return event_df
 
 
-def interpolate_daily(
-    wit_data: pd.DataFrame, pkey: str = "feature_id"
-) -> pd.DataFrame:
+def interpolate_daily(wit_data: pd.DataFrame, pkey: str = "feature_id") -> pd.DataFrame:
     """
     Interpolates WIT data to a daily frequency using a linear interpolation
 
@@ -654,7 +638,10 @@ def interpolate_daily(
 
 
 def time_since_last_inundation(
-    wit_data: pd.DataFrame, wit_im: Optional[pd.DataFrame], output_path: Path, pkey: str = "feature_id"
+    wit_data: pd.DataFrame,
+    wit_im: Optional[pd.DataFrame],
+    output_path: Path,
+    pkey: str = "feature_id",
 ) -> pd.DataFrame:
     """
     Calculates time since last inundation using the 'Gap After' logic.
@@ -721,7 +708,7 @@ def adaptive_inundation_threshold(
     chunk = int(wit_data["chunk"].iat[0])
 
     # 1. Identify and combine members
-    flat_members = list(set([item for sublist in members for item in sublist]))
+    flat_members = list({item for sublist in members for item in sublist})
     wit_df = wit_data[[pkey] + flat_members].copy()
     wit_df = _add_combined_members(wit_df, members)
 
@@ -739,7 +726,9 @@ def adaptive_inundation_threshold(
     # 4. Safety Logging
     total = len(threshold_df)
 
-    logger.debug(f"Chunk {chunk} has {total} features. Adaptive inundation threshold {threshold_percentile}  with Floor ({min_threshold}) and Ceiling ({max_threshold}).")
+    logger.debug(
+        f"Chunk {chunk} has {total} features. Adaptive inundation threshold {threshold_percentile}  with Floor ({min_threshold}) and Ceiling ({max_threshold})."
+    )
 
     # 5. Save and Return
     out_file = output_path / f"WIT_event_threshold{chunk}.parquet"
@@ -786,9 +775,7 @@ def merge_batches(
                             logger.warning(
                                 f"Monthly subset columns missing from {out_file}: {missing_cols}"
                             )
-                            available_subset = [
-                                c for c in monthly_subset if c in df.columns
-                            ]
+                            available_subset = [c for c in monthly_subset if c in df.columns]
                             dfs.append(df[available_subset])
                         else:
                             dfs.append(df[monthly_subset])
@@ -847,16 +834,12 @@ def delete_old_batch_outputs(path: Path, output_filenames: List[str]) -> None:
         logger.debug(f"Deleted {deleted_count} batch outputs")
 
 
-
-
 # ------------------------------------------------------------------------------
 # Batch loader
 # ------------------------------------------------------------------------------
 
 
-def load_batch(
-    csv_files: List[Path], chunk_id: int, config: WITMetricsConfig
-) -> Optional[pd.DataFrame]:
+def load_batch(csv_files: List[Path], chunk_id: int, config) -> Optional[pd.DataFrame]:
     """
     Loads, cleans, and combines a batch of CSV files.
 
@@ -897,17 +880,13 @@ def load_batch(
         # 2. Robust Date Normalization
         # Use format='mixed' to handle both "YYYY-MM-DD" and "YYYY-MM-DD HH:MM:SS"
         df["date"] = (
-            pd.to_datetime(df["date"], utc=True, format="mixed")
-            .dt.tz_localize(None)
-            .dt.normalize()
+            pd.to_datetime(df["date"], utc=True, format="mixed").dt.tz_localize(None).dt.normalize()
         )
 
         dfs.append(df)
 
     if not dfs:
-        logger.warning(
-            f"Chunk {chunk_id}: No valid data after loading {len(csv_files)} files"
-        )
+        logger.warning(f"Chunk {chunk_id}: No valid data after loading {len(csv_files)} files")
         return None
 
     # 3. Combine all files
@@ -959,9 +938,7 @@ def write_batch_parquet(batch_df: pd.DataFrame, batch_fname: Path) -> Path:
 # ------------------------------------------------------------------------------
 
 
-def process_batch(
-    csv_files: List[Path], chunk_id: int, config: WITMetricsConfig
-) -> None:
+def process_batch(csv_files: List[Path], chunk_id: int, config) -> None:
     """
     Orchestrates the processing of a single batch of files.
 
@@ -1029,11 +1006,9 @@ def process_batch(
 
 
 def main() -> None:
-    config:WITMetricsConfig = load_config("wit_metrics")
+    config = load_config("wit_metrics")
     validate_config(config)
     setup_logging(config.log_path, __name__)
-
-
 
     output_filenames = [
         "WIT_yearly_metrics",
@@ -1052,13 +1027,13 @@ def main() -> None:
     if total_csv_files == 0:
         RuntimeError(f"No CSV files found in {config.wit_csv_path}")
         return
-    
+
     # create output directory
     try:
         config.output_path.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-        raise RuntimeError(f"Cannot create output_path {config.output_path}: {e}")
-    
+        raise RuntimeError(f"Cannot create output_path {config.output_path}: {e}") from e
+
     # Cleanup any old batch outputs from prior runs
     delete_old_batch_outputs(config.output_path, output_filenames)
 
@@ -1076,7 +1051,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Batch-level multiprocessing only
     # ------------------------------------------------------------------
-    for j in tqdm(range(0, total_csv_files, chunk_size), desc=f"Processing chunks", ncols=160):
+    for j in tqdm(range(0, total_csv_files, chunk_size), desc="Processing chunks", ncols=160):
         mp_batch = csv_list[j : j + chunk_size]
 
         work = []
@@ -1110,7 +1085,5 @@ def main() -> None:
     delete_old_batch_outputs(config.output_path, output_filenames)
 
 
-
 if __name__ == "__main__":
-
     main()

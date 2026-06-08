@@ -1,8 +1,10 @@
-import os
 import logging
+import os
 
 import psutil
-from dask.distributed import Client as DaskClient, LocalCluster
+from dask.distributed import Client as DaskClient
+from dask.distributed import LocalCluster
+
 logger = logging.getLogger(__name__)
 
 _client = None
@@ -11,8 +13,9 @@ _client = None
 # DASK SETUP
 # =========================
 
+
 def start_dask(workers=None):
-    """Start a Dask local cluster with optimized settings."""   
+    """Start a Dask local cluster with optimized settings."""
 
     total_memory_gb = psutil.virtual_memory().total / (1024**3)
     n_cores = os.cpu_count()
@@ -56,9 +59,9 @@ def start_dask(workers=None):
     logger.info(f"Dask cluster: {n_workers} workers")
     logger.info(f"  x {threads_per_worker} threads per worker")
     logger.info(f"  x {memory_limit_per_worker} GB worker memory limit")
-    logger.info(f"{50*'='}")
+    logger.info(f"{50 * '='}")
     logger.info(f"Dask Dashboard: {cluster.dashboard_link}")
-    logger.info(f"{50*'='}")
+    logger.info(f"{50 * '='}")
 
     return client
 

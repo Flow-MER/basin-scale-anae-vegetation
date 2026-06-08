@@ -8,7 +8,14 @@ The BWS Priorities Project aimed to spatially and temporally summarise metrics o
 
 * [LInk to report from the DCCEEW website](https://www.dcceew.gov.au/sites/default/files/documents/assessing-vulnerability-use-determining-basin-scale-environmental-watering-priorities.pdf)
 
-The Jupyter notebook is the final stage of data processing that pulls together multiple data sets to summarise and score the condition metrics, stress metrics and then add the scores to the final vulnerability metric.  Multiple input data files are read in, pivoted to tabular format with years as columns.  The measurement of vulnerability relies on first calculating the long-term baseline (mean of all years excluding the millennium drought) then scoring the deviation from the baseline.   Metrics calculated for ANAE ecosystem polygons are aggregated together as an area weighted average for larger spatial units (e.g. Ramsar sites, valleys).
+The measurement of vulnerability relies on first calculating the long-term baseline (mean of all years excluding the millennium drought) then scoring the deviation from the baseline.  
+You said
+
+ The overarching logic is to have a standardized measure of ecosystem condition (this is currently a 5-year rolling mean of the z-scores). And then to weight that condition measure by the trend on the logic that an ecosystem that is declining is more vulnerable than an ecosystem that is improving. so static condition + trend are added together. calculate z-scores independently on annual an monthly. then calculate the trend in the z-score, not the trend in the raw metrics (NDVI, soil moisture).
+
+
+
+ Metrics calculated for ANAE ecosystem polygons are aggregated together as an area weighted average for larger spatial units (e.g. Ramsar sites, valleys).
 
 ## Data Inputs
 
@@ -76,3 +83,15 @@ Dr Shane Brooks
 <https://brooks.eco>
 
 ![Brooks.eco logo](brooks-logo.png "Brooks Ecology & Technology")
+
+
+
+
+
+| Step                                                               | Approx Rows × Columns                                     | Columns                  | Notes / Memory Considerations                                                                                         |
+| ------------------------------------------------------------------ | --------------------------------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| **1. Monthly → Annual** (`_monthly_to_mean_annual`)                | 270,000 × 5 metrics × ~40 years ≈ 10.8M rows              | `UID`, `date`, metrics   | Water year or calendar year aggregation; returns new DataFrame; memory-efficient because aggregation reduces rows     |
+| **2. Z-scores** (`_standardise_z_minimal`)                         | 270,000 × 40 years × N metrics = 10.8M rows × N z columns | `UID`, `date`, `*_z`     | Only stores z-score columns; original metrics untouched; optional baseline exclusions applied per UID                 |
+| **3. Rolling + Trend + Sum** (`_rolling_and_slope_sum_vectorized`) | Same as previous (10.8M)                                  | `UID`, `date`, `*_sum`   | Computes rolling mean + trend slope + sum **in one pass**; no intermediate full copies; masks prevent cross-UID leaks |
+| **4. Integer Scores** (`_metric_scores`)                           | Same as previous (10.8M)                                  | `UID`, `date`, `*_score` | Converts continuous sums to discrete vulnerability scores per metric; final output is minimal                         |
+

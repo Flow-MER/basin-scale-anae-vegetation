@@ -11,25 +11,28 @@ Key Features:
 - **Resilience**: Handles network retries and falls back to remote URLs if caching fails.
 - **Cascading Fallbacks**: Supports multiple fallback caches configured via .env file.
 """
-import os
-import time
-import random
-import shutil
-import logging
-import threading
+
+import gzip
 import hashlib
 import json
-from pathlib import Path
+import logging
+import os
+import random
+import shutil
+import threading
+import time
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import defaultdict, OrderedDict
 from functools import wraps
-import pystac
 from inspect import signature
-import gzip
+from pathlib import Path
+
+import pystac
 
 # Load .env file at module import time
 try:
-    from dotenv import load_dotenv, find_dotenv
+    from dotenv import find_dotenv, load_dotenv
+
     # Try to find .env in current directory or parents
     dotenv_path = find_dotenv(usecwd=True)
     if dotenv_path:
@@ -38,32 +41,37 @@ try:
     else:
         logging.getLogger(__name__).debug("No .env file found")
 except ImportError:
-    logging.getLogger(__name__).warning("python-dotenv not installed, using environment variables only")
+    logging.getLogger(__name__).warning(
+        "python-dotenv not installed, using environment variables only"
+    )
 
 import requests
-
 
 logger = logging.getLogger(__name__)
 
 # needed for cache_search decorator
 _cache_instance = None
 
+
 def configure_cache(*args, **kwargs):
     global _cache_instance
     _cache_instance = STACCache(*args, **kwargs)
+
 
 def cache_search(func):
     if _cache_instance is None:
         return func
     return _cache_instance.cache_search(func)
 
+
 class RateLimiter:
     """
     Thread-safe token bucket for global bandwidth throttling.
-    
+
     Ensures that the aggregate download rate across all threads does not exceed
     the specified limit.
     """
+
     def __init__(self, max_rate_mb):
         """
         Args:
@@ -96,15 +104,15 @@ class RateLimiter:
 class STACCache:
     """
     Manages local caching of remote STAC assets.
-    
+
     This class handles:
     1.  Mapping remote URLs to local file paths.
     2.  Downloading files in the background using a thread pool.
     3.  Managing disk space and cleaning up stale temporary files.
     4.  Providing a `patch_url` method compatible with `odc.stac.load`.
-    
+
     The cache is persistent across runs if the `cache_root` remains the same.
-    
+
     Configuration via .env file:
     ---------------------------
     STAC_CACHE_ROOT       - Primary cache location (required if using get_instance())
@@ -113,7 +121,7 @@ class STACCache:
     STAC_CACHE_MAX_WORKERS - Number of download worker threads
     PATCH_URL_DELAY       - Delay in seconds for patch_url wait
     STAC_CACHE_MAX_RATE_MB - Rate limit in MB/s
-    
+
     Example .env:
     ------------
     STAC_CACHE_ROOT=e:/dea-local-cache
@@ -122,9 +130,10 @@ class STACCache:
     STAC_CACHE_MAX_WORKERS=8
     PATCH_URL_DELAY=3
     """
+
     _instance = None
     _instance_lock = threading.Lock()
-    
+
     def __init__(
         self,
         cache_root,
@@ -175,44 +184,48 @@ class STACCache:
             if not self.readonly and not os.access(self.cache_root, os.W_OK):
                 logger.warning(f"No write access to {self.cache_root}, switching to read-only")
                 self.readonly = True
-                
+
             if min_free_space_mb < 0:
                 logger.warning(f"Invalid min_free_space_mb={min_free_space_mb}, defaulting to 1000")
                 min_free_space_mb = 1000
             self.min_free_space = min_free_space_mb * 1024 * 1024
-            
+
             if not self.readonly:
                 self.enabled = self._check_disk_space(self.min_free_space)
                 if not self.enabled:
-                    logger.warning(f"Insufficient disk space, cache disabled")
+                    logger.warning("Insufficient disk space, cache disabled")
 
             self._url_map = OrderedDict()
             self._inflight = {}
             self._lock = threading.Lock()
-            
+
             self._limiter = RateLimiter(max_rate_mb)
-            
+
             if patch_url_delay < 0 or patch_url_delay >= 5:
-                logger.warning(f"Invalid patch_url_delay={patch_url_delay}, must be >=0 and <5, defaulting to 0.1")
+                logger.warning(
+                    f"Invalid patch_url_delay={patch_url_delay}, must be >=0 and <5, defaulting to 0.1"
+                )
                 patch_url_delay = 0.1
             self.patch_url_delay = float(patch_url_delay)
-          
+
             if url_list_capacity <= 0:
-                logger.warning(f"Invalid url_list_capacity={url_list_capacity}, defaulting to 10000")
+                logger.warning(
+                    f"Invalid url_list_capacity={url_list_capacity}, defaulting to 10000"
+                )
                 url_list_capacity = 10000
             self._url_list_capacity = int(url_list_capacity)
 
             cpu_count = os.cpu_count() or 4
-            
+
             if read_timeout < 0:
                 logger.warning(f"Invalid read_timeout={read_timeout}, defaulting to 600")
                 read_timeout = 600
             self._timeout = (30, read_timeout)
-            
+
             if max_workers is None:
                 max_workers = min(16, max(4, cpu_count))
             self.workers = int(max_workers)
-            
+
             if not self.readonly:
                 self._executor = ThreadPoolExecutor(max_workers=self.workers)
             else:
@@ -230,23 +243,23 @@ class STACCache:
                 f"copy_up={self.copy_up}, "
                 f"fallback={'yes' if fallback_cache else 'no'})"
             )
-            
+
         except Exception as e:
             logger.error(f"Failed to initialize cache at {cache_root}: {e}")
             self.enabled = False
             self._executor = None
             raise
-            
+
     @classmethod
     def get_instance(cls, **kwargs):
         """
         Singleton accessor with configuration from .env file.
-        
+
         Configuration is read from environment variables (typically loaded from .env):
-        
+
         Required:
             STAC_CACHE_ROOT - Primary cache location
-        
+
         Optional:
             STAC_CACHE_FALLBACKS - Comma-separated list of fallback cache paths
             STAC_CACHE_COPY_UP - Set to "1" to enable copy-up
@@ -255,16 +268,16 @@ class STACCache:
             STAC_CACHE_MAX_RATE_MB - Rate limit in MB/s
             STAC_CACHE_READONLY - Set to "1" for read-only mode
             STAC_CACHE_SEARCHES - cache pystac catalog search results
-        
+
         Keyword arguments override environment variables.
-        
+
         Example .env:
             STAC_CACHE_ROOT=e:/dea-local-cache
             STAC_CACHE_FALLBACKS=r:/dea-master,t:/dea-archive
             STAC_CACHE_MAX_WORKERS=8
             PATCH_URL_DELAY=3
-            
-        
+
+
         Usage:
             cache = STACCache.get_instance()
             patch_url = cache.patch_url
@@ -275,111 +288,111 @@ class STACCache:
                     config = cls._build_config_from_env(**kwargs)
                     cls._instance = cls(**config)
         return cls._instance
-    
+
     @classmethod
     def _build_config_from_env(cls, **kwargs):
         """
         Build configuration from environment variables.
-        
+
         Creates a cascading chain of fallback caches from STAC_CACHE_FALLBACKS.
-        
+
         Priority: kwargs > environment variables
         """
         config = kwargs.copy()
-        
+
         # Primary cache root (required)
-        if 'cache_root' not in config:
-            cache_root = os.getenv('STAC_CACHE_ROOT')
+        if "cache_root" not in config:
+            cache_root = os.getenv("STAC_CACHE_ROOT")
             if not cache_root:
                 raise ValueError(
                     "STAC_CACHE_ROOT environment variable is required. "
                     "Set it in your .env file or pass cache_root= parameter."
                 )
-            config['cache_root'] = cache_root
-        
+            config["cache_root"] = cache_root
+
         # Build cascading fallback chain
-        if 'fallback_cache' not in config:
+        if "fallback_cache" not in config:
             fallback_chain = cls._build_fallback_chain_from_env()
             if fallback_chain:
-                config['fallback_cache'] = fallback_chain
-        
+                config["fallback_cache"] = fallback_chain
+
         # Copy-up setting
-        if 'copy_up' not in config:
-            copy_up_env = os.getenv('STAC_CACHE_COPY_UP', '').lower()
-            config['copy_up'] = copy_up_env in ('1', 'true', 'yes')
-        
+        if "copy_up" not in config:
+            copy_up_env = os.getenv("STAC_CACHE_COPY_UP", "").lower()
+            config["copy_up"] = copy_up_env in ("1", "true", "yes")
+
         # Max workers
-        if 'max_workers' not in config:
-            max_workers_env = os.getenv('STAC_CACHE_MAX_WORKERS')
+        if "max_workers" not in config:
+            max_workers_env = os.getenv("STAC_CACHE_MAX_WORKERS")
             if max_workers_env and max_workers_env.isdigit():
-                config['max_workers'] = int(max_workers_env)
-        
+                config["max_workers"] = int(max_workers_env)
+
         # Patch URL delay
-        if 'patch_url_delay' not in config:
-            delay_env = os.getenv('PATCH_URL_DELAY')
+        if "patch_url_delay" not in config:
+            delay_env = os.getenv("PATCH_URL_DELAY")
             if delay_env:
                 try:
-                    config['patch_url_delay'] = float(delay_env)
+                    config["patch_url_delay"] = float(delay_env)
                 except ValueError:
                     logger.warning(f"Invalid PATCH_URL_DELAY: {delay_env}")
-        
+
         # Rate limit
-        if 'max_rate_mb' not in config:
-            rate_env = os.getenv('STAC_CACHE_MAX_RATE_MB')
+        if "max_rate_mb" not in config:
+            rate_env = os.getenv("STAC_CACHE_MAX_RATE_MB")
             if rate_env:
                 try:
-                    config['max_rate_mb'] = float(rate_env)
+                    config["max_rate_mb"] = float(rate_env)
                 except ValueError:
                     logger.warning(f"Invalid STAC_CACHE_MAX_RATE_MB: {rate_env}")
-        
+
         # Read-only mode
-        if 'readonly' not in config:
-            readonly_env = os.getenv('STAC_CACHE_READONLY', '').lower()
-            config['readonly'] = readonly_env in ('1', 'true', 'yes')
-        
-        #Cache catalog search results
-        if 'cache_searches' not in config:
-            cache_search_env = os.getenv('STAC_CACHE_SEARCHES', '').lower()
-            config['cache_searches'] = cache_search_env in ('1', 'true', 'yes')
-        
+        if "readonly" not in config:
+            readonly_env = os.getenv("STAC_CACHE_READONLY", "").lower()
+            config["readonly"] = readonly_env in ("1", "true", "yes")
+
+        # Cache catalog search results
+        if "cache_searches" not in config:
+            cache_search_env = os.getenv("STAC_CACHE_SEARCHES", "").lower()
+            config["cache_searches"] = cache_search_env in ("1", "true", "yes")
+
         return config
-    
+
     @classmethod
     def _build_fallback_chain_from_env(cls):
         """
         Build cascading chain of fallback caches from STAC_CACHE_FALLBACKS.
-        
+
         STAC_CACHE_FALLBACKS should be a comma-separated list of paths:
             STAC_CACHE_FALLBACKS=r:/dea-master,t:/dea-archive,//server/shared
-        
+
         This creates a chain: master → archive → shared
-        
+
         Returns:
             Head of the fallback chain (first cache to check), or None
         """
-        fallbacks_env = os.getenv('STAC_CACHE_FALLBACKS')
+        fallbacks_env = os.getenv("STAC_CACHE_FALLBACKS")
         if not fallbacks_env:
             return None
-        
+
         # Split by comma and clean whitespace
-        fallback_paths = [p.strip() for p in fallbacks_env.split(',') if p.strip()]
-        
+        fallback_paths = [p.strip() for p in fallbacks_env.split(",") if p.strip()]
+
         if not fallback_paths:
             return None
-        
+
         logger.info(f"Building fallback chain from: {fallback_paths}")
-        
+
         # Build chain in reverse order (last → first)
         # So the first path in the list becomes the head of the chain
         chain = None
-        
+
         for path_str in reversed(fallback_paths):
             path = Path(path_str)
-            
+
             if not path.exists():
                 logger.warning(f"Fallback cache path does not exist: {path_str}")
                 continue
-            
+
             if cls._is_unc_path(path):
                 logger.info(f"Network path: {path_str}")
                 # Don't hang if network is down
@@ -387,8 +400,8 @@ class STACCache:
                     logger.warning(f"Network timeout: {path_str}")
             else:
                 if not path.exists():
-                    continue    
-            
+                    continue
+
             try:
                 # Create read-only cache instance
                 # Each fallback links to the previous one
@@ -396,13 +409,13 @@ class STACCache:
                     cache_root=str(path),
                     readonly=True,
                     enabled=True,
-                    fallback_cache=chain  # Link to previous in chain
+                    fallback_cache=chain,  # Link to previous in chain
                 )
                 logger.info(f"Added fallback cache: {path_str}")
             except Exception as e:
                 logger.error(f"Failed to create fallback cache for {path_str}: {e}")
                 continue
-        
+
         if chain:
             # Count the chain length for logging
             depth = 0
@@ -411,14 +424,14 @@ class STACCache:
                 depth += 1
                 current = current.fallback_cache
             logger.info(f"Fallback chain depth: {depth}")
-        
+
         return chain
-    
+
     @classmethod
     def reset_instance(cls):
         """
         Reset singleton instance.
-        
+
         Useful for testing or reconfiguration.
         """
         with cls._instance_lock:
@@ -428,7 +441,7 @@ class STACCache:
                 except Exception as e:
                     logger.warning(f"Error closing cache instance: {e}")
             cls._instance = None
-            
+
     def __enter__(self):
         """Support 'with STACCache() as cache:' syntax."""
         return self
@@ -437,64 +450,64 @@ class STACCache:
         """Ensure clean shutdown on context exit."""
         self.close()
         return False
-    
+
     def _check_fallback(self, url):
         """
         Check if URL exists in fallback cache chain.
-        
+
         Recursively checks through the entire fallback chain.
-        
+
         Returns:
             Local path if found in any fallback, None otherwise
         """
         if not self.fallback_cache:
             return None
-        
+
         try:
             result = self.fallback_cache.patch_url(url)
             if result != url:  # Found in fallback
                 return result
         except Exception as e:
             logger.warning(f"Error checking fallback cache: {e}")
-        
+
         return None
-    
+
     def _copy_from_fallback(self, source_path, url):
         """
         Copy file from fallback cache to this cache.
-        
+
         Args:
             source_path: Path to file in fallback cache
             url: Original URL (for mapping)
-            
+
         Returns:
             Path to copied file, or original source_path if copy fails
         """
         if self.readonly or not self.enabled:
             return source_path
-        
+
         try:
             # Determine destination
             s3_path = self._url_to_path(url)
             dest_path = self.cache_root / Path(s3_path)
             dest_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
             # Atomic copy (via temp file)
-            tmp_path = dest_path.with_suffix('.tmp')
+            tmp_path = dest_path.with_suffix(".tmp")
             shutil.copy2(source_path, tmp_path)
             os.replace(tmp_path, dest_path)
-            
+
             # Update memory map
             with self._lock:
                 while len(self._url_map) >= self._url_list_capacity:
                     self._url_map.popitem(last=False)
                 self._url_map[url] = str(dest_path)
-            
-            file_size = Path(dest_path).stat().st_size / (1<<20)
+
+            file_size = Path(dest_path).stat().st_size / (1 << 20)
             logger.debug(f"Copied from fallback: {source_path} -> {dest_path} ({file_size:.1f} MB)")
-            
+
             return str(dest_path)
-        
+
         except Exception as e:
             logger.warning(f"Copy-up failed for {url}: {e}")
             return source_path
@@ -507,25 +520,26 @@ class STACCache:
         except Exception as e:
             logger.warning(f"Failed to check disk space: {e}")
             return False
-    
+
     @staticmethod
     def _is_unc_path(path):
-        return str(path).startswith(('\\\\', '//'))
-    
+        return str(path).startswith(("\\\\", "//"))
+
     @staticmethod
     def _validate_path_with_timeout(path, timeout=5):
-        result = {'exists': False}
+        result = {"exists": False}
+
         def check():
             try:
-                result['exists'] = Path(path).is_file()
-            except:
-                result['exists'] = False
-        
+                result["exists"] = Path(path).is_file()
+            except Exception:
+                result["exists"] = False
+
         thread = threading.Thread(target=check, daemon=True)
         thread.start()
         thread.join(timeout=timeout)
-        return result['exists']
-    
+        return result["exists"]
+
     @staticmethod
     def _url_to_path(url):
         """
@@ -568,7 +582,7 @@ class STACCache:
     def _download_asset(self, url, priority=None, max_retries=3):
         """
         Download a single asset via HTTPS with atomic write and retries.
-        
+
         Why Atomic Write?
         We download to a .tmp file and then `os.replace` (rename) it to the final filename.
         This ensures that other processes or threads never see a partially downloaded file.
@@ -594,7 +608,9 @@ class STACCache:
 
             # Construct HTTPS URL
             if s3_path.startswith("dea-public-data/"):
-                https_url = f"https://data.dea.ga.gov.au/{s3_path.replace('dea-public-data/', '', 1)}"
+                https_url = (
+                    f"https://data.dea.ga.gov.au/{s3_path.replace('dea-public-data/', '', 1)}"
+                )
             elif url.startswith("http"):
                 https_url = url
             else:
@@ -645,7 +661,7 @@ class STACCache:
                         except OSError:
                             pass
                     if attempt < max_retries - 1:
-                        time.sleep(2 ** attempt)
+                        time.sleep(2**attempt)
 
             logger.error(f"Failed to download {s3_path} after {max_retries} attempts")
             return url, url
@@ -656,12 +672,12 @@ class STACCache:
     def _get_intersection_priority(self, item_bbox, filter_bboxes, padding=0.2):
         """
         Calculates download priority based on spatial intersection.
-        
+
         Why?
         Processing often happens sequentially (e.g., Macro-tile 1, then 2).
         We want to prioritize downloading assets for Macro-tile 1 so they are ready
         when the processor needs them, rather than downloading random tiles.
-        
+
         Returns the index of the *first* matching bbox in `filter_bboxes`.
         This ensures that if an item intersects multiple bboxes, it is assigned the
         priority of the lowest-index bbox (e.g. earliest macro-tile).
@@ -693,7 +709,7 @@ class STACCache:
     def _prune_url_map(self, num_to_remove=1000):
         """
         Enforces LRU (Least Recently Used) capacity on the internal URL map.
-        
+
         If _url_map is over capacity, removes the oldest items (Python 3.7+ dicts preserve insertion order).
         """
         # This method should be called within a lock.
@@ -717,18 +733,18 @@ class STACCache:
             # Simple FIFO eviction (fast, no I/O)
             while len(self._url_map) >= self._url_list_capacity:
                 self._url_map.popitem(last=False)  # Remove oldest entry
-            
+
             # Add new entry
             self._url_map[url] = str(path)
-            
+
             # Move to end to mark as recently used (optional, for true LRU)
             self._url_map.move_to_end(url)
-            
+
             # Remove from inflight tracking
             if url in self._inflight:
                 del self._inflight[url]
         logger.debug(f"Download completed: {url} -> {path}")
-    
+
     def _safe_callback(self, url, future):
         """Wrapper to catch exceptions in download callbacks."""
         try:
@@ -742,7 +758,7 @@ class STACCache:
     def _gather_assets(self, items, bands, intersection_filter, seen):
         assets = []
         total_bytes = 0
-        
+
         if not items:
             return assets, total_bytes
 
@@ -789,8 +805,12 @@ class STACCache:
 
         # Sort by priority so early macro-tile assets download first
         assets_to_download.sort(key=lambda x: x[0])
-        
-        total_expected = f" (~{total_expected_bytes / (1024 * 1024):.1f} MB expected)" if total_expected_bytes > 0 else ""
+
+        total_expected = (
+            f" (~{total_expected_bytes / (1024 * 1024):.1f} MB expected)"
+            if total_expected_bytes > 0
+            else ""
+        )
 
         logger.info(
             f"Starting {len(assets_to_download)} downloads with {self.workers} workers{total_expected}"
@@ -834,7 +854,9 @@ class STACCache:
 
         # Why: Validate that `items` is a non-empty list or tuple before proceeding.
         if not hasattr(items, "__iter__"):
-            logger.warning(f"Invalid 'items' type for caching. Expected iterable, got {type(items)}.")
+            logger.warning(
+                f"Invalid 'items' type for caching. Expected iterable, got {type(items)}."
+            )
             return
         if not items:
             logger.debug("No items provided to cache.")
@@ -865,16 +887,16 @@ class STACCache:
             logger.debug("STAC cache read-only")
             return
         elif not batches:
-            logger.debug("No batches to submit")    
+            logger.debug("No batches to submit")
             return
-        
+
         # Normalize input to list of batches if it looks like a single [items, bands] pair
         if isinstance(batches, (list, tuple)) and len(batches) == 2:
             second = batches[1]
             # Check if second element is likely 'bands' (list of strings or None)
             is_bands = second is None or (
-                isinstance(second, (list, tuple)) and 
-                (len(second) == 0 or isinstance(second[0], str))
+                isinstance(second, (list, tuple))
+                and (len(second) == 0 or isinstance(second[0], str))
             )
             if is_bands:
                 batches = [batches]
@@ -891,7 +913,7 @@ class STACCache:
             if not isinstance(batch, (list, tuple)) or len(batch) != 2:
                 logger.warning(f"Skipping invalid batch at index {i}: expected (items, bands)")
                 continue
-            
+
             items, bands = batch
             try:
                 assets, bytes_ = self._gather_assets(items, bands, intersection_filter, seen)
@@ -905,16 +927,16 @@ class STACCache:
     def patch_url(self, url, timeout=3):
         """
         Resolves a remote URL to a local file path if cached.
-        
+
         Lookup order:
         1. This cache (memory)
         2. This cache (disk)
         3. Fallback chain (recursive)
         4. Trigger download (if writable)
         5. Return original URL
-        
+
         This method is designed to be passed to `odc.stac.load(..., patch_url=cache.patch_url)`.
-        
+
         Logic:
         1. If cached (memory or disk), return local path.
         2. If downloading (inflight), wait briefly (`timeout`) for it to finish.
@@ -930,7 +952,7 @@ class STACCache:
         with self._lock:
             # Check memory map first
             path = self._url_map.get(url)
-            
+
             # Cached in memory
             if path and Path(path).is_file():
                 logger.debug(f"patch_url HIT in memory: {url} -> {path}")
@@ -946,29 +968,31 @@ class STACCache:
                 self._url_map[url] = resolved_path
                 logger.debug(f"patch_url HIT on disk: {url} -> {resolved_path}")
                 return resolved_path
-        
+
         # Check fallback chain (outside lock)
         fallback_path = self._check_fallback(url)
         if fallback_path:
-            logger.debug(f"Found in fallback: {url} -> {fallback_path}, copy_up={self.copy_up}, readonly={self.readonly}")
+            logger.debug(
+                f"Found in fallback: {url} -> {fallback_path}, copy_up={self.copy_up}, readonly={self.readonly}"
+            )
             if self.copy_up and not self.readonly:
                 # Copy to this cache for faster access next time
                 new_path = self._copy_from_fallback(fallback_path, url)
                 return new_path
             else:
                 # Use directly from fallback
-                logger.debug(f"Using fallback directly (copy_up disabled or readonly)")
+                logger.debug("Using fallback directly (copy_up disabled or readonly)")
                 with self._lock:
                     self._url_map[url] = fallback_path
                 return fallback_path
-        
+
         # Not found anywhere - trigger download if writable
         if self.readonly:
             return url
 
         with self._lock:
             inflight = self._inflight.get(url)
-            
+
             if not inflight:
                 # Not cached, not inflight → submit background download
                 fut = self._executor.submit(self._download_asset, url)
@@ -977,11 +1001,11 @@ class STACCache:
                 logger.debug(f"patch_url MISS and REQUESTED: {url}")
             else:
                 logger.debug(f"patch_url already in-flight: {url}")
-        
+
         # Short sleep to allow in-flight download to potentially complete
         if self.patch_url_delay > 0:
             time.sleep(self.patch_url_delay)
-            
+
             with self._lock:
                 path = self._url_map.get(url)
                 if path and Path(path).is_file():
@@ -994,7 +1018,7 @@ class STACCache:
     def patch_url_static(cache_root):
         """
         Returns a lightweight, read-only patch_url function.
-        
+
         Usage:
             patcher = STACCache.get_static_patcher(r"r:\\dea-local-cache")
             odc.stac.load(..., patch_url=patcher)
@@ -1015,6 +1039,7 @@ class STACCache:
             except Exception:
                 pass
             return url
+
         return patch
 
     def clear_url_map(self):
@@ -1041,16 +1066,16 @@ class STACCache:
                         pass
         if count > 0:
             logger.info(f"Cleaned up {count} stale .tmp files")
-            
+
     def cleanup_old_files(cache_root, max_age_days=90):
         """
         Remove files older than max_age_days.
-        
+
         With noatime: This removes files by download age, not access age.
         Good enough for: "Delete anything downloaded >90 days ago"
         """
         cutoff = time.time() - (max_age_days * 86400)
-        
+
         deleted = 0
         for filepath in cache_root.rglob("*.tif"):
             if filepath.stat().st_mtime < cutoff:
@@ -1059,7 +1084,7 @@ class STACCache:
                     deleted += 1
                 except OSError:
                     pass
-        
+
         return deleted
 
     def info(self):
@@ -1085,7 +1110,7 @@ class STACCache:
             print(f"Disk usage check failed: {e}")
 
         now = time.time()
-        
+
         # 2. Define the worker function for parallel execution
         def _scan_chunk(start_path):
             """
@@ -1101,10 +1126,10 @@ class STACCache:
                 "total_files": 0,
                 "total_bytes": 0,
             }
-            
+
             # Stack-based iteration to avoid recursion limits on deep trees
             stack = [start_path]
-            
+
             while stack:
                 current_path = stack.pop()
                 try:
@@ -1114,7 +1139,7 @@ class STACCache:
                             if entry.is_dir(follow_symlinks=False):
                                 stack.append(entry.path)
                                 continue
-                            
+
                             if not entry.is_file(follow_symlinks=False):
                                 continue
 
@@ -1171,7 +1196,7 @@ class STACCache:
                 except OSError:
                     # Permission denied or path disappeared
                     pass
-            
+
             return local_stats
 
         # 3. Prepare Work Chunks
@@ -1179,15 +1204,15 @@ class STACCache:
         # We aim to split until we have enough chunks to saturate threads, or hit a specific depth.
         scan_targets = [self.cache_root]
         target_chunk_count = 64  # Aim for plenty of chunks (4x workers) to balance load
-        max_split_depth = 4      # User indicated structure becomes meaningful at level 3
+        max_split_depth = 4  # User indicated structure becomes meaningful at level 3
 
         print("Discovering scan targets...")
-        
+
         current_depth = 0
         while current_depth < max_split_depth and len(scan_targets) < target_chunk_count:
             next_targets = []
             expanded_any = False
-            
+
             for path in scan_targets:
                 try:
                     # We only care about directories for splitting work
@@ -1198,21 +1223,21 @@ class STACCache:
                                 next_targets.append(entry.path)
                                 is_leaf = False
                                 expanded_any = True
-                    
+
                     # If no subdirectories found, this path is a work unit (leaf or files-only)
                     if is_leaf:
                         next_targets.append(path)
-                        
+
                 except OSError:
                     # If we can't read it now, keep it so the worker logs the error
                     next_targets.append(path)
-            
+
             if not expanded_any:
                 break
-                
+
             scan_targets = next_targets
             current_depth += 1
-            
+
         print(f"Identified {len(scan_targets)} scan targets at depth {current_depth}.")
 
         # 4. Execute Parallel Scan
@@ -1230,7 +1255,7 @@ class STACCache:
 
         with ThreadPoolExecutor(max_workers=16) as executor:
             future_to_path = {executor.submit(_scan_chunk, p): p for p in scan_targets}
-            
+
             for future in as_completed(future_to_path):
                 try:
                     data = future.result()
@@ -1239,30 +1264,30 @@ class STACCache:
                     final_stats["total_bytes"] += data["total_bytes"]
                     final_stats["unclassified_files"] += data["unclassified_files"]
                     final_stats["transient_ages"].extend(data["transient_ages"])
-                    
+
                     for k, v in data["age_buckets"].items():
                         final_stats["age_buckets"][k] += v
                     for k, v in data["transient_counts"].items():
                         final_stats["transient_counts"][k] += v
                     for k, v in data["collections"].items():
                         final_stats["collections"][k] += v
-                        
+
                 except Exception as exc:
                     print(f"Worker failed: {exc}")
 
         # 5. Print Summary
-        print(f"\nCache: {final_stats['total_bytes'] / (1 << 30):.2f} GB, {final_stats['total_files']} files")
+        print(
+            f"\nCache: {final_stats['total_bytes'] / (1 << 30):.2f} GB, {final_stats['total_files']} files"
+        )
         print("File age distribution:", dict(final_stats["age_buckets"]))
         print("Collection footprint (GB):")
-        
+
         for col, sz in sorted(final_stats["collections"].items(), key=lambda x: x[1], reverse=True):
             print(f"  {col}: {sz / (1 << 30):.2f}")
 
         oldest_tmp = max(final_stats["transient_ages"]) if final_stats["transient_ages"] else 0
         oldest_str = (
-            f"{int(oldest_tmp // 3600)}h {int((oldest_tmp % 3600) // 60)}m"
-            if oldest_tmp
-            else "N/A"
+            f"{int(oldest_tmp // 3600)}h {int((oldest_tmp % 3600) // 60)}m" if oldest_tmp else "N/A"
         )
         print(
             f"Transient files: Lock={final_stats['transient_counts']['lock']}, "
@@ -1271,7 +1296,6 @@ class STACCache:
         if final_stats["unclassified_files"]:
             print(f"Unclassified files: {final_stats['unclassified_files']}")
         print("-----------------------------------")
-
 
     def cache_search(self, func):
         """
@@ -1412,20 +1436,13 @@ class STACCache:
                 # -----------------------------
                 # 8. Write cache (atomic)
                 # -----------------------------
-                if (
-                    not self.readonly
-                    and items
-                    and hasattr(items, "__len__")
-                    and len(items) > 0
-                ):
+                if not self.readonly and items and hasattr(items, "__len__") and len(items) > 0:
                     try:
                         tmp_file = cache_file.with_suffix(".tmp")
                         with gzip.open(tmp_file, "wt", encoding="utf-8") as f:
                             json.dump(items.to_dict(), f)
                         tmp_file.replace(cache_file)
-                        logger.debug(
-                            f"Cached {len(items)} items to {cache_file.name}"
-                        )
+                        logger.debug(f"Cached {len(items)} items to {cache_file.name}")
                     except Exception as e:
                         logger.warning(f"Failed to write STAC cache: {e}")
 
@@ -1440,12 +1457,8 @@ class STACCache:
 
         return wrapper
 
-
-
     def close(self):
         """Shut down the thread pool executor."""
         if hasattr(self, "_executor") and self._executor:
             self._executor.shutdown(wait=True)
             logger.info("STACCache executor shut down")
-
-

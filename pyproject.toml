@@ -1,0 +1,46 @@
+[tool.pytest.ini_options]
+pythonpath = "."
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # import sorting
+    "W",   # warnings
+    "C4",  # flake8-comprehensions
+    "B",   # flake8-bugbear
+]
+
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "dev",
+    "dist",
+    "*.gdb",
+    "*.sde",
+    "*.lock",
+	".tmp",
+]
+
+ignore = [
+    ### Intentionally disabled
+    "E402",  # module level import not at top of file
+    "E501",  # line too long
+]
+ 
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.ruff.lint.isort]
+order-by-type = true
+relative-imports-order = "closest-to-furthest"
+extra-standard-library = ["typing"]
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+known-first-party = []

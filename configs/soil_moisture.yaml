@@ -1,0 +1,25 @@
+---
+# Soil Moisture Processing Configuration
+# Configuration for Soil Moisture processing via NCI THREDDS
+
+# THREDDS server settings
+thredds_awo_root_zone_soil_moisture_base_url: "https://thredds.nci.org.au/thredds/ncss/grid/iu04/australian-water-outlook/historical/v1/AWRALv7/processed/deciles/month/sm_pct.nc"
+local_root_zone_soil_moisture_relative_netcdf_path: "input/spatial/sm_pct.nc"
+
+# Data processing settings
+sm_var: "sm_pct"
+start_date: "1986-01-31"
+end_date: null  # null = use last month in netcdf
+crs_fallback: "EPSG:4326"  # WGS_84 matches netcdf
+
+# Dask processing parameters
+dask_n_workers_override: 16
+batch_size: 12  # Number of months to process in one Dask batch
+block_size: 5000  # Number of polygons per Dask worker to process together
+
+# Base configuration
+data_path: "data"
+log_path: "log"
+shapefile_path: "input/spatial/ANAEv3_WIT.shp"
+poly_unique_id: "UID"
+debug: true

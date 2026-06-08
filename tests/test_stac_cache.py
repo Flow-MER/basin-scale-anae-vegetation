@@ -1,7 +1,8 @@
 import sys
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 # Add project root to sys.path to allow imports from tools/
 current_path = Path(__file__).resolve().parent
@@ -11,8 +12,8 @@ if str(project_root) not in sys.path:
 
 from tools.stac_cache import STACCache
 
+
 class TestSTACCache:
-    
     @pytest.fixture
     def cache(self, tmp_path):
         # Initialize cache with 0MB min free space to ensure tests run regardless of disk space
@@ -45,7 +46,7 @@ class TestSTACCache:
         mock_get.return_value.__enter__.return_value = mock_response
 
         url = "https://data.dea.ga.gov.au/baseline/test_success.tif"
-        
+
         # Execute
         original_url, local_path = cache._download_asset(url)
 
@@ -53,7 +54,7 @@ class TestSTACCache:
         assert original_url == url
         assert Path(local_path).exists()
         assert Path(local_path).read_bytes() == content
-        
+
         # Verify directory structure
         expected_rel_path = "dea-public-data/baseline/test_success.tif"
         # Normalize separators for Windows/Linux compatibility in assertion
@@ -64,7 +65,7 @@ class TestSTACCache:
         """Test that existing files are not re-downloaded."""
         url = "https://data.dea.ga.gov.au/baseline/test_hit.tif"
         rel_path = "dea-public-data/baseline/test_hit.tif"
-        
+
         # Create dummy existing file
         file_path = tmp_path / rel_path
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,7 +84,7 @@ class TestSTACCache:
         mock_get.side_effect = Exception("Connection refused")
 
         url = "https://data.dea.ga.gov.au/baseline/fail.tif"
-        
+
         # Execute with 2 retries
         original_url, local_path = cache._download_asset(url, max_retries=2)
 
@@ -96,20 +97,24 @@ class TestSTACCache:
         # Mock STAC items
         item1 = MagicMock()
         item1.assets = {
-            "band1": MagicMock(href="https://data.dea.ga.gov.au/b1.tif", extra_fields={"file:size": 100}),
+            "band1": MagicMock(
+                href="https://data.dea.ga.gov.au/b1.tif", extra_fields={"file:size": 100}
+            ),
         }
         item2 = MagicMock()
         item2.assets = {
-            "band1": MagicMock(href="https://data.dea.ga.gov.au/b2.tif", extra_fields={"file:size": 100}),
+            "band1": MagicMock(
+                href="https://data.dea.ga.gov.au/b2.tif", extra_fields={"file:size": 100}
+            ),
         }
         items = [item1, item2]
 
         # Mock the executor to verify submission
         cache._executor = MagicMock()
-        
+
         # Execute
         cache.submit_cache_items(items, bands=["band1"])
-        
+
         # Verify
         # _submit_assets calls executor.submit for each asset
         assert cache._executor.submit.call_count == 2
@@ -119,7 +124,7 @@ class TestSTACCache:
         url = "http://example.com/1.tif"
         local_path = tmp_path / "1.tif"
         local_path.touch()
-        
+
         cache._url_map[url] = str(local_path)
         assert cache.patch_url(url) == str(local_path)
 
@@ -131,10 +136,10 @@ class TestSTACCache:
         local_file = tmp_path / rel_path
         local_file.parent.mkdir(parents=True, exist_ok=True)
         local_file.write_bytes(b"data")
-        
+
         # Ensure map is empty
         cache._url_map.clear()
-        
+
         result = cache.patch_url(url)
         assert result == str(local_file.resolve())
         # Should populate map
@@ -144,10 +149,10 @@ class TestSTACCache:
         """Test patch_url triggers download on miss."""
         url = "http://example.com/miss.tif"
         cache._executor = MagicMock()
-        
+
         # Call with short timeout
         result = cache.patch_url(url, timeout=0.01)
-        
+
         assert result == url
         cache._executor.submit.assert_called_once()
         assert url in cache._inflight
@@ -157,9 +162,9 @@ class TestSTACCache:
         url = "http://example.com/inflight.tif"
         cache._inflight[url] = (MagicMock(), None)
         cache._executor = MagicMock()
-        
+
         result = cache.patch_url(url, timeout=0.01)
-        
+
         assert result == url
         cache._executor.submit.assert_not_called()
 
@@ -169,17 +174,17 @@ class TestSTACCache:
         url = "http://example.com/wait.tif"
         dest = tmp_path / "wait.tif"
         dest.touch()
-        
+
         # Define side effect for sleep to simulate download completing
         def sleep_side_effect(seconds):
             cache._url_map[url] = str(dest)
-            
+
         mock_sleep.side_effect = sleep_side_effect
-        
+
         # Mock executor
         cache._executor = MagicMock()
-        
+
         result = cache.patch_url(url, timeout=1)
-        
+
         assert result == str(dest)
         cache._executor.submit.assert_called_once()

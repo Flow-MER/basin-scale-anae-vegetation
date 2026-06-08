@@ -1,31 +1,34 @@
 import sys
-import pytest
+from unittest.mock import patch
+
 import numpy as np
-import pandas as pd
+import pytest
 import xarray as xr
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 from data_pipelines.ndvi_landsat_monthly_dea import (
-    compute_ndvi,
-    zonal_mean,
-    create_macro_tiles,
     bbox_to_wgs84,
-    check_dask_graph
+    check_dask_graph,
+    compute_ndvi,
+    create_macro_tiles,
+    zonal_mean,
 )
+
 
 @pytest.fixture
 def mock_config():
-    """Mock configuration values."""
-    mock_cfg = MagicMock()
-    mock_cfg.crs = "EPSG:3577"
-    mock_cfg.tile_pixels = 100
-    mock_cfg.pixel_size = 30
-    mock_cfg.macro_tile_factor = 2
-    mock_cfg.poly_unique_id = "UID"
-    mock_cfg.max_dask_tasks = 1000
-    mock_cfg.max_dask_partitions = 100
-    return mock_cfg
+    """Mock configuration values using new YAML config."""
+    from config import NDVILandsatConfig
+
+    return NDVILandsatConfig(
+        crs="EPSG:3577",
+        tile_pixels=100,
+        pixel_size=30,
+        macro_tile_factor=2,
+        poly_unique_id="UID",
+        max_dask_tasks=1000,
+        max_dask_partitions=100,
+    )
+
 
 def test_compute_ndvi():
     """Test NDVI calculation formula and edge cases."""
@@ -35,9 +38,9 @@ def test_compute_ndvi():
     # NDVI = (NIR - Red) / (NIR + Red + 1e-6)
     # Case 1: (0.5 - 0.1) / (0.5 + 0.1) = 0.4 / 0.6 = 0.666...
     # Case 2: (0.2 - 0.2) / (0.2 + 0.2) = 0 / 0.4 = 0
-    
+
     result = compute_ndvi(red, nir)
-    
+
     assert result[0] == pytest.approx(0.666666, abs=1e-5)
     assert result[1] == pytest.approx(0.0, abs=1e-5)
 
@@ -48,6 +51,7 @@ def test_compute_ndvi():
     assert np.isfinite(result_zero[0])
     assert result_zero[0] == pytest.approx(0.0, abs=1e-5)
 
+
 def test_zonal_mean(mock_config):
     """Test zonal statistics aggregation logic."""
     # Setup 2x2 grid
@@ -57,7 +61,7 @@ def test_zonal_mean(mock_config):
     # Pixel 1,1: ID=0 (Background), NDVI=0.1, Clear=True
 
     ndvi_data = np.array([[0.8, 0.4], [0.2, 0.1]])
-    clear_data = np.array([[1, 1], [0, 1]]) # 1=Clear
+    clear_data = np.array([[1, 1], [0, 1]])  # 1=Clear
     tiles = np.array([[1, 1], [2, 0]])
 
     ndvi_da = xr.DataArray(ndvi_data, dims=("y", "x"))
@@ -85,6 +89,7 @@ def test_zonal_mean(mock_config):
     assert poly_b["count"] == 1
     assert poly_b["clear_pixels"] == 0
 
+
 def test_create_macro_tiles(mock_config):
     """Test grouping of tiles into macro tiles."""
     # Config: TILE_PIXELS=100, PIXEL_SIZE=30 -> Tile size = 3000m
@@ -92,15 +97,15 @@ def test_create_macro_tiles(mock_config):
 
     # Create 5 tiles
     tiles = [
-        {"tile_id": 0, "bounds": (0, 0, 3000, 3000)},       # Bottom-Left
-        {"tile_id": 1, "bounds": (3000, 0, 6000, 3000)},    # Bottom-Right
-        {"tile_id": 2, "bounds": (0, 3000, 3000, 6000)},    # Top-Left
-        {"tile_id": 3, "bounds": (3000, 3000, 6000, 6000)}, # Top-Right
-        {"tile_id": 4, "bounds": (6000, 0, 9000, 3000)},    # Outside first macro block
+        {"tile_id": 0, "bounds": (0, 0, 3000, 3000)},  # Bottom-Left
+        {"tile_id": 1, "bounds": (3000, 0, 6000, 3000)},  # Bottom-Right
+        {"tile_id": 2, "bounds": (0, 3000, 3000, 6000)},  # Top-Left
+        {"tile_id": 3, "bounds": (3000, 3000, 6000, 6000)},  # Top-Right
+        {"tile_id": 4, "bounds": (6000, 0, 9000, 3000)},  # Outside first macro block
     ]
 
     # Mock bbox_to_wgs84 to avoid ODC dependency issues
-    with patch("data_pipelines.ndvi_landsat_monthly_dea.bbox_to_wgs84", return_value=[0,0,1,1]):
+    with patch("data_pipelines.ndvi_landsat_monthly_dea.bbox_to_wgs84", return_value=[0, 0, 1, 1]):
         macro_tiles = create_macro_tiles(tiles, mock_config)
 
     assert len(macro_tiles) >= 2
@@ -114,6 +119,7 @@ def test_create_macro_tiles(mock_config):
     m1 = [m for m in macro_tiles if 4 in [t["tile_id"] for t in m["tiles"]]][0]
     assert len(m1["tiles"]) == 1
     assert m1["tiles"][0]["tile_id"] == 4
+
 
 def test_bbox_to_wgs84(mock_config):
     """Test coordinate transformation wrapper."""
@@ -135,10 +141,11 @@ def test_bbox_to_wgs84(mock_config):
 
 def test_check_dask_graph(mock_config):
     """Test dask graph size safety check."""
+
     # Mock object with __dask_graph__
     class MockDaskObj:
         def __dask_graph__(self):
-            return range(100) # 100 tasks
+            return range(100)  # 100 tasks
 
     obj = MockDaskObj()
 
