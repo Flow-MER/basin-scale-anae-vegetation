@@ -34,3 +34,5 @@ output-2yr-trend/
 *.xlsx
 *.parquet
 *.csv
+
+stac_cache.py
