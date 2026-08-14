@@ -3,28 +3,34 @@
 .venv/
 .backups/
 .git/
+.vscode/
 .gitignore
 .prj*
 .vscode/
-spatial/
+.coverage
 env/
 .env
 *.csv
 *.zip
 *.pyc
-*text.md
-ndvi/
-dev/
-ndvi_landsat/
-soil_moisture/
-log/
-!MDB_vegetation_vulnerability*.zip
-
+__pycache__/
+.pytest_cache/
+.ruff_cache/
 .ipynb_checkpoints/
 
-data/
-*.nc
+
 
 *.code-workspace
 .cspell/
+dev/
+log/
+data/
+input/
+output/
 
+output-2yr trend on 5yr-rolling/
+output-2yr-trend/
+
+*.xlsx
+*.parquet
+*.csv

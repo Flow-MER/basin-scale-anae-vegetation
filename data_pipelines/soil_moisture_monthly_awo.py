@@ -4,44 +4,87 @@ Monthly processing with parquet caching for incremental updates.
 Features: Lazy loading, pre-projection, and broadcasted rasters.
 """
 
-import geopandas as gpd
 import gc
-import xarray as xr
-import rioxarray
+import logging
+import sys
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlencode
+
+import geopandas as gpd
 import numpy as np
 import pandas as pd
-from dask import delayed
-from pathlib import Path
-import logging
 import requests
-from urllib.parse import urlencode
-from datetime import datetime
-import xml.etree.ElementTree as ET
-
+import xarray as xr
+from dask import delayed
+from dask.distributed import as_completed
 from exactextract import exact_extract
+
+# Add project root to sys.path to allow imports from config.py and tools/
+# This handles cases where the script is moved to a subfolder (e.g., input_pipelines/)
+current_path = Path(__file__).resolve().parent
+if (current_path / "config.py").exists():
+    project_root = current_path
+else:
+    project_root = current_path.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from config import SoilMoistureConfig, load_config
 from tools.dask import start_dask
 from tools.logging_setup import setup_logging
-from config import soil_moisture_cfg as config
-from dask.distributed import as_completed
-import time
 
 logger = logging.getLogger(__name__)
 
-def get_parquet_filename(output_dir, year, month):
-    """Generate parquet filename for a given year and month."""
-    return output_dir / f"soil_moisture_{year}_{month:02d}.parquet"
+dask_client = None
 
-def get_existing_months(output_dir):
+
+def validate_config(config) -> None:
+    """
+    Validates configuration before processing starts.
+    Catches issues early rather than failing hours into a batch job.
+    """
+    errors = []
+    warnings = []
+
+    # 1. Check critical paths exist
+    if not config.shapefile_path.is_file():
+        errors.append(f"shapefile_path is not a file: {config.shapefile_path}")
+
+    if not config.root_zone_soil_moisture_netcdf_path.is_file():
+        errors.append(
+            f"Root-zone soil moisture NetCDF file not found at : {config.root_zone_soil_moisture_netcdf_path}"
+        )
+
+    # Report results
+    if warnings:
+        for w in warnings:
+            logger.warning(f"Config warning: {w}")
+
+    if errors:
+        error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+        raise ValueError(error_msg)
+
+
+def get_parquet_filename(output_path, year, month):
+    """Generate parquet filename for a given year and month."""
+    return output_path / f"soil_moisture_{year}_{month:02d}.parquet"
+
+
+def get_existing_months(output_path):
     """Return set of (year, month) tuples for existing parquet files."""
     existing = set()
-    for f in output_dir.glob("soil_moisture_*.parquet"):
+    for f in output_path.glob("soil_moisture_*.parquet"):
         try:
-            parts = f.stem.split('_')
+            parts = f.stem.split("_")
             year, month = int(parts[2]), int(parts[3])
             existing.add((year, month))
         except (IndexError, ValueError):
             continue
     return existing
+
 
 @delayed
 def process_polygon_block_lazy(raster_data, gdf_block_future, year, month, unique_id):
@@ -58,30 +101,31 @@ def process_polygon_block_lazy(raster_data, gdf_block_future, year, month, uniqu
     Returns:
         tuple: (year, month, list of (uid, mean_value) tuples)
     """
-   
+
     # Extract mean values for all polygons in block
     stats_df = exact_extract(
-        raster_data, 
-        gdf_block_future, 
-        ['mean'], 
-        include_cols=[unique_id], 
-        output='pandas',
+        raster_data,
+        gdf_block_future,
+        ["mean"],
+        include_cols=[unique_id],
+        output="pandas",
     )
-    
+
     # Convert to list and clear DataFrame from memory
     val_col = [c for c in stats_df.columns if c != unique_id][0]
-    results = list(zip(stats_df[unique_id], stats_df[val_col]))
+    results = list(zip(stats_df[unique_id], stats_df[val_col], strict=True))
     del stats_df
     return year, month, results
 
+
 @delayed
-def write_month_parquet(month_results, cache_dir, variable_name, unique_id):
+def write_month_parquet(month_results, cache_path, variable_name, unique_id):
     """
     Write monthly results to parquet with atomic file operations.
 
     Args:
         month_results (list): List of results from process_polygon_block_lazy.
-        cache_dir (str or Path): Directory to save the parquet file.
+        cache_path (str or Path): Directory to save the parquet file.
         variable_name (str): Name of the variable being processed.
         unique_id (str): The column name for the unique polygon identifier.
 
@@ -93,15 +137,15 @@ def write_month_parquet(month_results, cache_dir, variable_name, unique_id):
     data = [(uid, val) for _, _, block in month_results for uid, val in block]
 
     df = pd.DataFrame(data, columns=[unique_id, variable_name])
-    df['year'] = year
-    df['month'] = month
+    df["year"] = year
+    df["month"] = month
 
-    parquet_path = get_parquet_filename(Path(cache_dir), year, month)
+    parquet_path = get_parquet_filename(Path(cache_path), year, month)
 
     # Atomic write: tmp file then rename
     try:
         tmp_out = parquet_path.with_suffix(".tmp.parquet")
-        df.to_parquet(tmp_out, index=False)  
+        df.to_parquet(tmp_out, index=False)
         tmp_out.rename(parquet_path)
         result = str(parquet_path)
     except Exception as e:
@@ -141,32 +185,23 @@ def get_ncss_time_range(base_url):
 
 
 def download_mdb_soilmoisture_subset(
-    polygon_path,
-    output_path,
-    start_date,
-    cache_dir,
-    end_date=None,
-    gdf=None,
-    unique_id=None,
+    cache_path: Path,
+    config: SoilMoistureConfig,
+    area_bounds: np.ndarray,
 ):
     """
     Downloads a subset of the soil moisture NetCDF from NCI THREDDS server
     based on the bounding box of the provided polygon file.
 
     Args:
-        polygon_path (Path): Path to the polygon shapefile.
-        output_path (Path): Path where the downloaded NetCDF will be saved.
-        start_date (str): Start date for the data subset (YYYY-MM-DD).
-        cache_dir (Path): Directory containing cached parquet files (used for date checking).
-        end_date (str, optional): End date for the data subset. Defaults to None (latest).
-        gdf (GeoDataFrame, optional): Pre-loaded GeoDataFrame to avoid reloading.
-        unique_id (str, optional): Column name for unique ID, used if loading gdf.
+        config (SoilMoistureConfig): Configuration object.
+        gdf_bounds (np.ndarray, optional): Bounding box [minx, miny, maxx, maxy].
 
     Returns:
         GeoDataFrame: The loaded polygon data (if loaded during process), else None.
     """
-    output_path = Path(output_path)
-    base_url = config.THREDDS_AWO_ROOT_ZONE_SOIL_MOISTURE_BASE_URL
+    output_path = config.root_zone_soil_moisture_netcdf_path
+    base_url = config.thredds_awo_root_zone_soil_moisture_base_url
 
     # Check remote availability against cache
     meta_end_str = get_ncss_time_range(base_url)
@@ -206,7 +241,7 @@ def download_mdb_soilmoisture_subset(
             should_download = False
         else:
             remote_ym = (remote_end_dt.year, remote_end_dt.month)
-            existing_months = get_existing_months(cache_dir)
+            existing_months = get_existing_months(cache_path)
             if existing_months:
                 last_cached_ym = max(existing_months)
 
@@ -231,23 +266,13 @@ def download_mdb_soilmoisture_subset(
         should_download = False
 
     if not should_download:
-        return gdf
+        return
 
     logger.info(f"Downloading soil moisture data from NCI THREDDS to {output_path}...")
 
     try:
         # 1. Get bounds from shapefile
-        if gdf is None:
-            cols = [unique_id, "geometry"] if unique_id else None
-            gdf = gpd.read_file(polygon_path, columns=cols)
-
-        # Transform to WGS84 (EPSG:4326) for NCSS lat/lon coordinates
-        if gdf.crs and gdf.crs.to_epsg() != 4326:
-            gdf_bounds = gdf.to_crs("EPSG:4326")
-        else:
-            gdf_bounds = gdf
-
-        minx, miny, maxx, maxy = gdf_bounds.total_bounds
+        minx, miny, maxx, maxy = area_bounds
 
         # Buffer slightly (0.1 degree) to ensure full coverage of edge polygons
         buffer = 0.1
@@ -264,17 +289,13 @@ def download_mdb_soilmoisture_subset(
                 return f"{d_str}T00:00:00Z"
             return d_str
 
-        s_date = format_date(start_date)
+        s_date = format_date(config.start_date)
 
-        if end_date:
-            e_date = format_date(end_date)
+        if config.end_date:
+            e_date = format_date(config.end_date)
         else:
             # Try to get actual dataset end date, fallback to now
-            e_date = (
-                meta_end_str
-                if meta_end_str
-                else datetime.now().strftime("%Y-%m-%dT00:00:00Z")
-            )
+            e_date = meta_end_str if meta_end_str else datetime.now().strftime("%Y-%m-%dT00:00:00Z")
 
         params = {
             "var": "sm_pct",
@@ -299,7 +320,6 @@ def download_mdb_soilmoisture_subset(
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         logger.info("Download complete.")
-        return gdf
 
     except Exception as e:
         logger.error(f"Download failed: {e}")
@@ -308,134 +328,124 @@ def download_mdb_soilmoisture_subset(
         raise
 
 
-def load_and_scatter_polygons(dask_client, polygon_path, target_crs, unique_id, block_size, gdf=None):
+def load_and_scatter_polygons(
+    dask_client, shapefile_path, target_crs, unique_id, block_size, gdf=None
+):
     """
     Loads (or uses existing) polygons, projects them, splits into blocks, and scatters to Dask workers.
     Returns a list of Dask futures for the blocks.
     """
     logger.info("Preparing polygon blocks for scatter...")
-    
+
     # Load if not provided
     if gdf is None:
-        logger.info(f"Reading shapefile {polygon_path}...")
-        gdf = gpd.read_file(polygon_path, columns=[unique_id, "geometry"])
-    
+        logger.info(f"Reading shapefile {shapefile_path}...")
+        gdf = gpd.read_file(shapefile_path, columns=[unique_id, "geometry"])
+
     # Project if needed
     if gdf.crs and gdf.crs.to_epsg() != target_crs.to_epsg():
         logger.info(f"Projecting polygons to {target_crs}...")
         gdf = gdf.to_crs(target_crs)
-        
+
     # Split into blocks
     logger.info(f"Splitting {len(gdf)} polygons into blocks of {block_size}...")
     total_polygons = len(gdf)
     blocks = [gdf.iloc[i : i + block_size].copy() for i in range(0, total_polygons, block_size)]
-    
+
     # Scatter
     logger.info("Scattering blocks to workers...")
     futures = [dask_client.scatter(block) for block in blocks]
-    
+
     # Explicit cleanup
     del gdf
     del blocks
     gc.collect()
-    
+
     return futures
 
-def compute_zonal_statistics(
-    polygon_shapefile,
-    unique_id,
-    cache_dir,
-    output_dir,
-    netcdf_file,
-    variable_name="soil_moisture",
-    n_workers=4,
-    block_size=1000,
-    batch_size=12,
+
+def compute_soil_moisture_zonal_statistics(
+    cache_path: Path,
+    config: SoilMoistureConfig,
     gdf=None,
 ):
     """
     Compute monthly zonal statistics from NetCDF to parquet cache.
     Processes only months not already cached. Uses Dask for parallel computation.
-    Polygons are often smaller than the 5km raster pixels so we keep polygons as vector geometry
-    by using "Exact extract" library for zonal stats.
-    This is CPU intensive so more workers is better if you have the resources
-    
+
     Memory optimization strategy:
     - Process months in batches to limit concurrent memory usage
     - Scatter polygon blocks to workers once (avoid repeated transfers)
     - Explicit cleanup with del and gc.collect() after each batch
     - Use exact_extract for efficient zonal statistics
-    
+
     Args:
-        polygon_shapefile (str): Path to polygon shapefile
-        unique_id (str): Column name for unique polygon ID
-        cache_dir (str): Directory to store temporary parquet files
-        output_dir (str): Directory for final CSV zip outputs
-        netcdf_file (str): Path to input NetCDF file
-        variable_name (str): Variable name in NetCDF to process
-        n_workers (int): Number of Dask workers. 
-        block_size (int): Number of polygons per worker block
-        batch_size (int): Number of months to process in parallel
+        config (SoilMoistureConfig): Configuration object.
         gdf (GeoDataFrame, optional): Pre-loaded GeoDataFrame.
 
     Returns:
         bool: True if new data was processed, False if all cached
     """
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     return_value = False
 
     # Open NetCDF with lazy loading (chunks prevent loading entire file)
     logger.info("Opening Soil Moisture NetCDF...")
     try:
-        ds = xr.open_dataset(netcdf_file, chunks={"time": 1})
-    except FileNotFoundError:
-        logger.error(f"NetCDF file not found: {netcdf_file}")
-        return return_value 
+        ds = xr.open_dataset(
+            config.root_zone_soil_moisture_netcdf_path,
+            chunks={"time": 1},
+        )
     except Exception as e:
-        logger.error(f"Failed to open NetCDF {netcdf_file}: {e}")
+        logger.error(f"Failed to open NetCDF {config.root_zone_soil_moisture_netcdf_path}: {e}")
         return return_value
 
     # Determine time range to process
     all_times = pd.to_datetime(ds.time.values)
-    logger.info(f"Soil Moisture NetCDF time range: {all_times[0].strftime('%Y-%m-%d')} to {all_times[-1].strftime('%Y-%m-%d')}")
-    start_date = pd.to_datetime(config.START_DATE)
-    end_date = pd.to_datetime(config.END_DATE) if config.END_DATE else all_times[-1]
+    logger.info(
+        f"Soil Moisture NetCDF time range: {all_times[0].strftime('%Y-%m-%d')} to {all_times[-1].strftime('%Y-%m-%d')}"
+    )
+    start_date = pd.to_datetime(config.start_date)
+    end_date = pd.to_datetime(config.end_date) if config.end_date else all_times[-1]
 
-    da = ds[variable_name].sel(time=slice(start_date, end_date))
+    da = ds[config.sm_var].sel(time=slice(start_date, end_date))
     times = pd.to_datetime(da.time.values)
 
     # Skip already processed months (incremental processing)
-    existing_months = get_existing_months(cache_dir)
-    job_list = [(pd.Timestamp(t).year, pd.Timestamp(t).month, i) 
-                for i, t in enumerate(times) 
-                if (pd.Timestamp(t).year, pd.Timestamp(t).month) not in existing_months]
+    existing_months = get_existing_months(cache_path)
+    job_list = [
+        (pd.Timestamp(t).year, pd.Timestamp(t).month, i)
+        for i, t in enumerate(times)
+        if (pd.Timestamp(t).year, pd.Timestamp(t).month) not in existing_months
+    ]
 
     if not job_list:
-        logger.info(f"No new months to process. All data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} are cached.")
+        logger.info(
+            f"No new months to process. All data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} are cached."
+        )
         return return_value
 
     logger.info(f"Processing {len(job_list)} months: {job_list[0][:2]} to {job_list[-1][:2]}")
+    dask_client = start_dask(workers=config.dask_n_workers_override)
 
     # Ensure CRS is set for raster data
     if da.rio.crs is None:
-        da = da.rio.write_crs(config.CRS_FALLBACK)
+        da = da.rio.write_crs(config.crs_fallback)
     target_crs = da.rio.crs
 
     # Rechunk for optimal processing (512x512 spatial tiles, 1 time slice)
     x_dim = da.rio.x_dim
-    y_dim = da.rio.y_dim    
+    y_dim = da.rio.y_dim
     da = da.chunk({x_dim: 512, y_dim: 512, "time": 1})
-
-    # Initialize Dask distributed client
-    dask_client = start_dask(workers=n_workers)
 
     # Initial scatter
     try:
         gdf_block_futures = load_and_scatter_polygons(
-            dask_client, polygon_shapefile, target_crs, unique_id, block_size, gdf
+            dask_client,
+            config.shapefile_path,
+            target_crs,
+            config.poly_unique_id,
+            config.block_size,
+            gdf,
         )
     except Exception as e:
         logger.error(f"Failed to prepare polygons: {e}")
@@ -447,8 +457,8 @@ def compute_zonal_statistics(
         del gdf
     gc.collect()
     # Process months in batches to control memory usage
-    for batch_start in range(0, len(job_list), batch_size):
-        batch = job_list[batch_start:batch_start + batch_size]
+    for batch_start in range(0, len(job_list), config.batch_size):
+        batch = job_list[batch_start : batch_start + config.batch_size]
         write_tasks = []
 
         # Retry logic to handle worker crashes (e.g. OOM) or lost scattered data
@@ -458,7 +468,12 @@ def compute_zonal_statistics(
                 if attempt > 0:
                     logger.info("Retrying batch: Re-reading and re-scattering polygon blocks...")
                     gdf_block_futures = load_and_scatter_polygons(
-                        dask_client, polygon_shapefile, target_crs, unique_id, block_size, gdf=None
+                        dask_client,
+                        config.shapefile_path,
+                        target_crs,
+                        config.poly_unique_id,
+                        config.block_size,
+                        gdf=None,
                     )
 
                 # Process each month in the batch
@@ -470,27 +485,36 @@ def compute_zonal_statistics(
 
                     # Create tasks for all polygon blocks for this month
                     month_tasks = [
-                        process_polygon_block_lazy(month_future, block_fut, year, month, unique_id)
+                        process_polygon_block_lazy(
+                            month_future, block_fut, year, month, config.poly_unique_id
+                        )
                         for block_fut in gdf_block_futures
                     ]
 
                     # Chain write task after computation
                     write_tasks.append(
-                        write_month_parquet(month_tasks, str(cache_dir), variable_name, unique_id)
+                        write_month_parquet(
+                            month_tasks,
+                            str(cache_path),
+                            config.sm_var,
+                            config.poly_unique_id,
+                        )
                     )
 
                     # Clean up month data immediately
                     del month_da
 
                 # Execute batch: compute zonal stats + write parquet files in parallel
-                logger.info(f"Computing batch {batch_start//batch_size + 1}: {len(write_tasks)} months")
+                logger.info(
+                    f"Computing batch {batch_start // config.batch_size + 1}: {len(write_tasks)} months"
+                )
 
                 # Submit tasks and get futures for progress tracking
                 futures = dask_client.compute(write_tasks, sync=False)
 
                 # Log progress as tasks complete
                 completed_count = 0
-                for future in as_completed(futures):
+                for _future in as_completed(futures):
                     completed_count += 1
                     logger.info(f"Progress: {completed_count}/{len(futures)} months completed")
 
@@ -510,12 +534,13 @@ def compute_zonal_statistics(
                         return_value = True
                 break
             except Exception as e:
-                logger.warning(f"Batch {batch_start//batch_size + 1} failed  {attempt + 1}/{max_retries}: {e}")
+                logger.warning(
+                    f"Batch {batch_start // config.batch_size + 1} failed  {attempt + 1}/{max_retries}: {e}"
+                )
                 dask_client.run(gc.collect)
                 if attempt == max_retries - 1:
                     raise e
                 time.sleep(5)
-    
 
     # Cleanup scattered futures and close dataset
     del gdf_block_futures
@@ -525,28 +550,21 @@ def compute_zonal_statistics(
     return return_value
 
 
-def aggregate_parquets(cache_dir, output_dir, unique_id, variable_name="soil_moisture"):
+def aggregate_monthly_results(cache_path, output_path, sm_var, poly_unique_id):
     """
     Aggregate monthly parquet files into decadal CSV zip files.
-    
+
     Groups all cached monthly data by decade and writes compressed CSVs.
 
     Args:
-        cache_dir (Path): Directory containing monthly parquet files.
-        output_dir (Path): Directory to save aggregated zip files.
-        unique_id (str): Column name for unique polygon ID.
-        variable_name (str): Name of the variable to include in output.
+        config (SoilMoistureConfig): Configuration object.
     """
-    cache_dir = Path(cache_dir)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
     logger.info("Aggregating monthly parquets to decadal CSVs...")
-    all_parquets = sorted(cache_dir.glob("soil_moisture_*.parquet"))
+    all_parquets = sorted(cache_path.glob("soil_moisture_*.parquet"))
     if not all_parquets:
-        logger.warning(f"No parquet files found in {cache_dir}")
+        logger.warning(f"No parquet files found in {cache_path}")
         return
-    
+
     # Read all parquet files and combine
     try:
         dfs = [pd.read_parquet(f) for f in all_parquets]
@@ -556,79 +574,89 @@ def aggregate_parquets(cache_dir, output_dir, unique_id, variable_name="soil_moi
     except Exception as e:
         logger.error(f"Failed to read parquet files: {e}")
         return
-        
+
     # Group by decade and write separate files
-    combined['decade'] = (combined['year'] // 10) * 10
-    for decade, group in combined.groupby('decade'):
+    combined["decade"] = (combined["year"] // 10) * 10
+    for decade, group in combined.groupby("decade"):
         start_year = decade
         end_year = decade + 9
-        zip_path = output_dir / f"soil_moisture_{start_year}_{end_year}.zip"
+        zip_path = output_path / f"soil_moisture_{start_year}_{end_year}.zip"
         csv_name = f"soil_moisture_{start_year}_{end_year}.csv"
         try:
             # Write only required columns
-            group[[unique_id, 'year', 'month', variable_name]].to_csv(
+            group[[poly_unique_id, "year", "month", sm_var]].to_csv(
                 zip_path,
                 index=False,
-                compression={'method': 'zip', 'archive_name': csv_name}
+                compression={"method": "zip", "archive_name": csv_name},
             )
             logger.info(f"Saved {zip_path}")
         except Exception as e:
             logger.error(f"Failed to write {zip_path}: {e}")
-    
+
     # Final cleanup
     del combined
     gc.collect()
 
+
 def main():
     """Process soil moisture NetCDF to decadal CSV outputs.
-    
+
     Workflow:
     1. Compute monthly zonal statistics (cached as parquet)
     2. Aggregate cached months into decadal CSV zip files
-    
-    Configuration: see soil_moisture_cfg in config.py
-    Logs: written to config.LOG_DIR
-    """
-    setup_logging(config.LOG_DIR, "soil_moisture_processing")
-    logger.info("Starting soil moisture processing")
-    logger.info(f"Input: {config.LOCAL_ROOT_ZONE_SOIL_MOISTURE_RELATIVE_NETCDF_PATH}")
-    logger.info(f"Polygons: {config.POLYGON_PATH}")
-    logger.info(f"Date range: {config.START_DATE} to {config.END_DATE or 'end of file'}")
 
-    gdf = None
+    Configuration: see soil_moisture_cfg in config.py
+    Logs: written to config.LOG_path
+    """
+    config = load_config("soil_moisture")
+    validate_config(config)
+    setup_logging(config.log_path, "soil_moisture_processing")
+
+    logger.info("Starting soil moisture processing")
+    logger.info(f"Input: {config.root_zone_soil_moisture_netcdf_path}")
+    logger.info(f"Polygons: {config.shapefile_path}")
+    logger.info(f"Date range: {config.start_date} to {config.end_date or 'most recent available'}")
+
+    cache_path = config.output_path / "cache"
+    # create cache folder and parent output folder
     try:
-        gdf = download_mdb_soilmoisture_subset(
-            config.POLYGON_PATH,
-            config.LOCAL_ROOT_ZONE_SOIL_MOISTURE_RELATIVE_NETCDF_PATH,
-            config.START_DATE,
-            config.CACHE_DIR,
-            config.END_DATE,
-            gdf=gdf,
-            unique_id=config.POLY_UID,
-        )
+        cache_path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise RuntimeError(f"Cannot create cache {cache_path}: {e}") from e
+
+    gdf = gpd.read_file(config.shapefile_path, columns=[config.poly_unique_id, "geometry"])
+
+    # Transform to WGS84 (EPSG:4326) for NCSS lat/lon coordinates
+    # soil moisture data is also EPSG:4326
+    if gdf.crs and gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs("EPSG:4326")
+    # 1. Get bounds from shapefile to select area of interest for data download
+    gdf_bounds = gdf.total_bounds
+
+    try:
+        download_mdb_soilmoisture_subset(cache_path, config, area_bounds=gdf_bounds)
     except Exception as e:
         logger.warning(
             f"Could not download NetCDF: {e}. Proceeding with existing file if available."
         )
 
+    # Initialize Dask distributed client
+
     try:
-        if compute_zonal_statistics(
-            polygon_shapefile=config.POLYGON_PATH,
-            unique_id=config.POLY_UID,
-            cache_dir=config.CACHE_DIR,
-            output_dir=config.OUTPUT_DIR,
-            netcdf_file=config.LOCAL_ROOT_ZONE_SOIL_MOISTURE_RELATIVE_NETCDF_PATH,
-            variable_name=config.SM_VAR,
-            n_workers=config.DASK_N_WORKERS_OVERRIDE,
-            block_size=config.BLOCK_SIZE,
-            batch_size=config.BATCH_SIZE,
-            gdf=gdf,
-        ):
-            aggregate_parquets(config.CACHE_DIR, config.OUTPUT_DIR, config.POLY_UID, config.SM_VAR)
+        if compute_soil_moisture_zonal_statistics(cache_path, config, gdf=gdf):
+            aggregate_monthly_results(
+                cache_path, config.output_path, config.sm_var, config.poly_unique_id
+            )
         logger.info("Processing complete")
     except Exception as e:
         logger.error(f"Processing failed: {e}", exc_info=True)
         raise
+    finally:
+        if dask_client:
+            try:
+                dask_client.close()
+            except (ValueError, OSError):
+                pass
 
 
 if __name__ == "__main__":

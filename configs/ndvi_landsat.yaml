@@ -1,0 +1,35 @@
+---
+# NDVI Landsat Processing Configuration
+# Configuration for Landsat NDVI processing via DEA STAC
+
+# STAC and collection settings
+stac_url: "https://explorer.dea.ga.gov.au/stac"
+landsat_collections:
+  - "ga_ls5t_ard_3"
+  - "ga_ls7e_ard_3"
+  - "ga_ls8c_ard_3"
+  - "ga_ls9c_ard_3"
+wofs_collection: "ga_ls_wo_3"
+
+# Spatial and processing parameters
+crs: "EPSG:3577"
+pixel_size: 30
+tile_pixels: 2048
+macro_tile_factor: 4
+
+# Temporal parameters
+start_year: 2025
+start_date: [1988, 1]
+end_date: null  # null = process to most recent available
+
+# Processing parameters
+wofs_filter_mask: 99  # 0b01100011 in decimal
+max_dask_tasks: 50000
+max_dask_partitions: 500
+
+# Base configuration
+data_path: "data"
+log_path: "log"
+shapefile_path: "input/spatial/ANAEv3_WIT.shp"
+poly_unique_id: "UID"
+debug: true

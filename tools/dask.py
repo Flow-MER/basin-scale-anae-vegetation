@@ -1,22 +1,25 @@
-import os
 import logging
+import os
 
 import psutil
-from dask.distributed import Client as DaskClient, LocalCluster
-from config import ndvi_landsat_cfg as config
+from dask.distributed import Client as DaskClient
+from dask.distributed import LocalCluster
 
 logger = logging.getLogger(__name__)
+
+_client = None
 
 # =========================
 # DASK SETUP
 # =========================
 
+
 def start_dask(workers=None):
-    """Start a Dask local cluster with optimized settings."""   
-    
+    """Start a Dask local cluster with optimized settings."""
+
     total_memory_gb = psutil.virtual_memory().total / (1024**3)
     n_cores = os.cpu_count()
-    
+
     # We leave 20% or 4GB (whichever is larger) for the OS to prevent freezing
     usable_ram = max(total_memory_gb * 0.8, total_memory_gb - 4)
     # Small number of workers for STAC loading efficiency
@@ -29,40 +32,43 @@ def start_dask(workers=None):
         n_workers=n_workers,
         threads_per_worker=threads_per_worker,
         memory_limit=f"{memory_limit_per_worker}GB",
-        dashboard_address=f":{config.DASK_DASHBOARD_PORT}",
         silence_logs=logging.ERROR,
         env={
             # Public cloud buckets (DEA, AWS Open Data, etc.)
             "AWS_NO_SIGN_REQUEST": "YES",
-
             # Robust HTTP behavior for flaky networks
             "GDAL_HTTP_MAX_RETRY": "10",
             "GDAL_HTTP_RETRY_DELAY": "3",
             "GDAL_HTTP_TIMEOUT": "45",
-
             # Prevent expensive LIST / directory probes on S3 / HTTP
             "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-
             # Small in-process read cache (per worker)
             "VSI_CACHE": "TRUE",
             "VSI_CACHE_SIZE": "10485760",  # 10 MB
-            
             # Enable HTTP/2 for faster concurrent header requests
             "GDAL_HTTP_VERSION": "2",
-
             # Important: Keep connections open between internal rasterio/gdal calls
             "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
-
             # Use persistent connections across workers
             "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff,.vrt",
         },
     )
 
+    client = DaskClient(cluster)
+
     logger.info(f"Dask cluster: {n_workers} workers")
     logger.info(f"  x {threads_per_worker} threads per worker")
     logger.info(f"  x {memory_limit_per_worker} GB worker memory limit")
-    logger.info(f"{50*'='}")
-    logger.info(f"Dask Dashboard: http://127.0.0.1:{config.DASK_DASHBOARD_PORT}/status")
-    logger.info(f"{50*'='}")
+    logger.info(f"{50 * '='}")
+    logger.info(f"Dask Dashboard: {cluster.dashboard_link}")
+    logger.info(f"{50 * '='}")
 
-    return DaskClient(cluster)
+    return client
+
+
+def get_dask_client():
+    """Get or create Dask client for distributed computing."""
+    global _client
+    if _client is None or _client.status == "closed":
+        _client = start_dask()
+    return _client

@@ -8,7 +8,14 @@ The BWS Priorities Project aimed to spatially and temporally summarise metrics o
 
 * [LInk to report from the DCCEEW website](https://www.dcceew.gov.au/sites/default/files/documents/assessing-vulnerability-use-determining-basin-scale-environmental-watering-priorities.pdf)
 
-The Jupyter notebook is the final stage of data processing that pulls together multiple data sets to summarise and score the condition metrics, stress metrics and then add the scores to the final vulnerability metric.  Multiple input data files are read in, pivoted to tabular format with years as columns.  The measurement of vulnerability relies on first calculating the long-term baseline (mean of all years excluding the millennium drought) then scoring the deviation from the baseline.   Metrics calculated for ANAE ecosystem polygons are aggregated together as an area weighted average for larger spatial units (e.g. Ramsar sites, valleys).
+The measurement of vulnerability relies on first calculating the long-term baseline (mean of all years excluding the millennium drought) then scoring the deviation from the baseline.  
+You said
+
+ The overarching logic is to have a standardized measure of ecosystem condition (this is currently a 5-year rolling mean of the z-scores). And then to weight that condition measure by the trend on the logic that an ecosystem that is declining is more vulnerable than an ecosystem that is improving. so static condition + trend are added together. calculate z-scores independently on annual an monthly. then calculate the trend in the z-score, not the trend in the raw metrics (NDVI, soil moisture).
+
+
+
+ Metrics calculated for ANAE ecosystem polygons are aggregated together as an area weighted average for larger spatial units (e.g. Ramsar sites, valleys).
 
 ## Data Inputs
 
@@ -30,6 +37,19 @@ e.g.  pv_median_DIWA_5yr_condition.csv  is the median "pv" (green fractional cov
 1. removed the MDBA Stand Condition tool inputs
 2. threshold NDVI inputs to positive values only (limits influence of areas of open water)
 3. removed unvegetated ANAE classes (lakes, clay pans)
+
+### WIT Threshold - time since last inundation
+To quantify inundation and intervening dry periods for each wetland polygon, we derived a feature-specific inundation threshold from the long-term distribution of water extent. Monthly fractional inundation (expressed as the proportion of the polygon classified as open water or saturated substrate) was available for a 40-year period for each feature.
+
+For each polygon, an adaptive inundation threshold was defined as the 30th percentile (P30) of the long-term distribution of fractional inundation. This percentile-based approach provides a robust, non-parametric estimate of a characteristic wet condition while limiting sensitivity to extreme wet years, long inundated plateaus, and skewed or zero-inflated distributions commonly observed across heterogeneous wetland types. The use of a lower percentile intentionally biases the threshold toward conservative identification of ecologically meaningful re-wetting events, reflecting the assumption that false positive inundation detections are more detrimental to downstream vegetation stress estimates than delayed detection of inundation.
+
+To prevent spurious classification driven by noise or permanently inundated features, the adaptive threshold was constrained within fixed bounds. A minimum threshold of 0.05 (5% area) was imposed to exclude classification noise and trivial wetting in predominantly dry systems, while a maximum threshold of 0.5 was applied to prevent permanent or near-permanent water bodies from being classified as dry when below average water levels still cover the majority of the area. These bounds ensure consistency of inundation detection across ephemeral, seasonal, and perennial systems.
+
+A Time since last inundation (TSLI) metric is defined as the number of consecutive days since the most recent inundation event. TSLI was updated using a moving temporal window across the full time series, resetting to zero only when fractional inundation exceeded the threshold. Periods below the threshold increment TSLI monotonically, representing accumulating dry duration relevant to vegetation stress.
+
+To assess the sensitivity of TSLI to threshold selection, additional thresholds based on the 20th and 40th percentiles (P20 and P40) were also computed for all features. These alternative thresholds represent more conservative and more permissive inundation definitions, respectively, and provide bounds on uncertainty associated with threshold choice. Sensitivity analyses focused on the effects of threshold variation on derived TSLI metrics, rather than on inundation frequency alone, reflecting the primary role of inundation events as resets of hydrologic memory within vegetation stress modeling.
+
+
 
 ### Mapping the outputs
 
@@ -63,3 +83,15 @@ Dr Shane Brooks
 <https://brooks.eco>
 
 ![Brooks.eco logo](brooks-logo.png "Brooks Ecology & Technology")
+
+
+
+
+
+| Step                                                               | Approx Rows × Columns                                     | Columns                  | Notes / Memory Considerations                                                                                         |
+| ------------------------------------------------------------------ | --------------------------------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| **1. Monthly → Annual** (`_monthly_to_mean_annual`)                | 270,000 × 5 metrics × ~40 years ≈ 10.8M rows              | `UID`, `date`, metrics   | Water year or calendar year aggregation; returns new DataFrame; memory-efficient because aggregation reduces rows     |
+| **2. Z-scores** (`_standardise_z_minimal`)                         | 270,000 × 40 years × N metrics = 10.8M rows × N z columns | `UID`, `date`, `*_z`     | Only stores z-score columns; original metrics untouched; optional baseline exclusions applied per UID                 |
+| **3. Rolling + Trend + Sum** (`_rolling_and_slope_sum_vectorized`) | Same as previous (10.8M)                                  | `UID`, `date`, `*_sum`   | Computes rolling mean + trend slope + sum **in one pass**; no intermediate full copies; masks prevent cross-UID leaks |
+| **4. Integer Scores** (`_metric_scores`)                           | Same as previous (10.8M)                                  | `UID`, `date`, `*_score` | Converts continuous sums to discrete vulnerability scores per metric; final output is minimal                         |
+

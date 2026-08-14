@@ -1,3 +1,8 @@
+python-dotenv #to manage environment variables for API keys, etc.
+# Progress Monitoring (optional)
+tqdm>=4.64.0
+ipykernel
+ipywidgets
 # For Landsat NDVI vegetation vulnerability analysis
 # Core Scientific Computing
 numpy>=1.21.0
@@ -11,6 +16,7 @@ rasterio>=1.3.0
 rioxarray>=0.13.0
 pyproj>=3.4.0
 exactextract>=0.2.0
+scikit_stats
 
 # DEA/STAC Data Access
 odc-stac>=0.3.0
@@ -25,7 +31,9 @@ psutil>=5.9.0
 # File I/O Optimization
 pyarrow>=10.0.0  # Fast parquet I/O for caching
 
-# Progress Monitoring (optional)
-tqdm>=4.64.0
 
-odc_algo  #for cloud mask dilation
+#odc_algo  #for cloud mask dilation (not implemented)
+fiona
+
+
+openpyxl #to save debug filespip

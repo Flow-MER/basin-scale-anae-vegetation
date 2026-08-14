@@ -1,0 +1,39 @@
+---
+# WIT Metrics Processing Configuration
+# Configuration for WIT metrics pipeline
+
+# Input data settings
+wit_csv_path: "m:\\ANAE_MDB_WIT_Feb_2026"
+pc_missing_threshold: 0.1  # Only use WIT data where pc_missing < threshold (>90% visible)
+wit_feature_id: "feature_id"
+
+# Processing options
+interpolate_to_daily: true  # Computationally expensive but improves estimates
+save_interpolated_csv: false  # Save interpolated daily WIT csv (takes up space)
+debug_event_times: true  # Save intermediate event timing data
+
+# Monthly subset for memory management
+# Set to null to save all metrics (warning: very large files)
+monthly_subset:
+  - "feature_id"
+  - "date"
+  - "water+wet_median"
+  - "npv+pv+wet_median"
+  - "count"
+
+# Processing parameters
+batch_size: 500  # Number of WIT csv files per batch
+tag: "MDB"  # Tag prepended to final result files
+zip_result: true  # Zip final result csv to save space
+
+# Inundation detection thresholds
+threshold_percentile: 0.3  # 30th percentile of 'water+wet' area
+min_threshold: 0.05  # Floor for dry sites (5% area)
+max_threshold: 0.50  # Cap for very wet sites (permanent lake threshold)
+
+# Base configuration
+data_path: "data"
+log_path: "log"
+shapefile_path: "input/spatial/ANAEv3_WIT.shp"
+poly_unique_id: "UID"
+debug: true

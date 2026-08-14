@@ -1,0 +1,113 @@
+---
+# Vegetation Vulnerability Analysis Configuration
+# Main configuration for vulnerability assessment pipeline
+
+# Input data paths
+csv_input_path: "data/wit-metrics"
+ndvi_csv_input_path: "data/ndvi"
+soil_moisture_csv_input_path: "data/soil_moisture"
+
+# Analysis parameters
+millennium_drought: [2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010]
+veg_window_width: 5  # Vegetation analysis window width (years)
+veg_trend_width: 2   # Trend analysis window width (years)
+
+# Spatial data files
+valley_shp: "input/spatial/BWSRegions.shp"
+diwa_shp: "input/spatial/DIWA_complex.shp"
+ramsar_shp: "input/spatial/ramsar_wetlands.shp"
+
+# Input data files
+wit_metrics_zip: "data/wit_metrics/MDB_WIT_monthly_metrics.zip"
+wit_tsli_zip: "data/wit_metrics/MDB_WIT_time_since_last_inundation.zip"
+wit_inundation_zip: "data/wit_metrics/MDB_WIT_inundation_metrics.zip"
+ndvi_path: "data/ndvi/landsat"
+soil_moisture_zip: "data/soilmoisture/ZonalSt30_soilmoistureanomally.zip"
+
+# TSLI stress thresholds by vegetation functional group (days)
+vegetation_tsli_stress_thresholds:
+  "river red gum swamps and forest": [0, 730, 1825]    # 0, 2, 5 years
+  "river red gum woodland": [0, 1460, 2555]            # 0, 4, 7 years
+  "black box swamps and forest": [0, 1095, 2555]       # 0, 3, 7 years
+  "black box woodland": [0, 1825, 3285]                # 0, 5, 9 years
+  "cooba woodland": [0, 1460, 2555]                    # 0, 4, 7 years
+  "coolibah swamp": [0, 2555, 5475]                    # 0, 7, 15 years
+  "coolibah woodland": [0, 3650, 7300]                 # 0, 10, 20 years
+  "lignum swamp": [0, 1095, 1825]                      # 0, 3, 5 years
+  "lignum shrubland": [0, 1825, 2555]                  # 0, 5, 7 years
+  "shrubland": [0, 1460, 3650]                         # 0, 4, 10 years
+  "woodland and shrubland swamp": [0, 1095, 2555]      # 0, 3, 7 years
+  "woodland (other)": [0, 1825, 3285]                  # 0, 5, 9 years
+  "permanent lakes": [0, 182, 365]                     # 0, 0.5, 1 year
+  "temporary lakes": [0, 1095, 1825]                   # 0, 3, 5 years
+  "tall emergent marsh": [0, 365, 730]                 # 0, 1, 2 years
+  "permanent aquatic meadow": [0, 365, 547]            # 0, 1, 1.5 years
+  "temporary herbfield": [0, 365, 1460]                # 0, 1, 4 years
+  "clay pan": [0, 3650, 7300]                          # 0, 10, 20 years
+
+# ANAE type to functional group mappings
+# Maps specific ANAE vegetation types to broader functional groups
+anae_type_to_functional_group:
+  "river red gum woodland":
+    - "f1.4: river red gum woodland riparian zone or floodplain"
+  "cooba woodland":
+    - "f1.11: river cooba woodland riparian zone or floodplain"
+  "black box woodland":
+    - "f1.8: black box woodland riparian zone or floodplain"
+  "coolibah woodland":
+    - "f1.10: coolibah woodland and forest riparian zone or floodplain"
+  "woodland (other)":
+    - "f1.12: woodland riparian zone or floodplain"
+  "lignum shrubland":
+    - "f2.2: lignum shrubland riparian zone or floodplain"
+  "shrubland":
+    - "f2.4: shrubland riparian zone or floodplain"
+  "river red gum swamps and forest":
+    - "f1.2: river red gum forest riparian zone or floodplain"
+    - "pt1.1.2: temporary river red gum swamp"
+  "black box swamps and forest":
+    - "f1.6: black box forest riparian zone or floodplain"
+    - "pt1.2.2: temporary black box swamp"
+  "lignum swamp":
+    - "pt1.7.2: temporary lignum swamp"
+  "coolibah swamp":
+    - "pt1.3.2: temporary coolibah swamp"
+  "woodland and shrubland swamp":
+    - "pt1.6.2: temporary woodland swamp"
+    - "pt1.8.2: temporary shrub swamp"
+  "permanent lakes":
+    - "lp1.1: permanent lake"
+    - "lp1.2: permanent lake with aquatic bed"
+    - "lsp1.1: permanent saline lake"
+    - "lsp1.2: permanent saline lake with aquatic bed"
+  "temporary lakes":
+    - "lt1.1: temporary lake"
+    - "lt1.2: temporary lake with aquatic bed"
+    - "lst1.1: temporary saline lake"
+    - "lst1.2: temporary saline lake with aquatic bed"
+  "permanent aquatic meadow":
+    - "pp2.2.2: permanent sedge/grass/forb marsh"
+    - "pp2.3.2: permanent grass marsh"
+    - "pp2.4.2: permanent forb marsh"
+    - "pp4.2: permanent wetland"
+    - "psp4: permanent saline wetland"
+  "temporary herbfield":
+    - "pt2.2.2: temporary sedge/grass/forb marsh"
+    - "f3.2: sedge/forb/grassland riparian zone or floodplain"
+    - "pt2.3.2: freshwater meadow"
+    - "pt1: temporary swamps"
+    - "pt4.2: temporary wetland"
+    - "pst4: temporary saline wetland"
+    - "pst2.2: temporary salt marsh"
+  "tall emergent marsh":
+    - "pp2.1.2: permanent tall emergent marsh"
+    - "pt2.1.2: temporary tall emergent marsh"
+  "clay pan":
+    - "pt3.1.2: clay pan"
+
+# Base configuration
+data_path: "data"
+log_path: "log"
+shapefile_path: "input/spatial/ANAEv3_WIT.shp"
+poly_unique_id: "UID"
+debug: true
