@@ -48,4 +48,8 @@ def setup_logging(log_dir, script_name, file_level=logging.DEBUG, console_level=
 
     root_logger.addHandler(console_handler)
 
+    # Rasterio emits very verbose internal GDAL diagnostics when the root logger
+    # is at DEBUG. Keep actionable warnings and errors without flooding log files.
+    logging.getLogger("rasterio").setLevel(logging.WARNING)
+
     logging.info(f"Logging to: {log_file}")
