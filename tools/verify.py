@@ -38,6 +38,7 @@ def make_verify_env(project_root: Path) -> tuple[dict[str, str], Path]:
     env["TMP"] = str(run_tmp)
     env["TEMP"] = str(run_tmp)
     env["TMPDIR"] = str(run_tmp)
+    env["PYTHONIOENCODING"] = "utf-8"
 
     return env, run_tmp
 
