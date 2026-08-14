@@ -16,18 +16,21 @@ import gzip
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import shutil
 import threading
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from inspect import signature
 from pathlib import Path
 
 import pystac
+import rasterio
+from rasterio.enums import Resampling
 
 # Load .env file at module import time
 try:
@@ -53,15 +56,420 @@ logger = logging.getLogger(__name__)
 _cache_instance = None
 
 
-def configure_cache(*args, **kwargs):
-    global _cache_instance
-    _cache_instance = STACCache(*args, **kwargs)
+def validate_raster(path):
+    try:
+        with rasterio.open(path) as src:
+            for band in range(1, src.count + 1):
+                # Read every native TIFF block.
+                for _, window in src.block_windows(band):
+                    src.read(band, window=window, masked=False)
+
+                # Also read overviews, since odc may use them.
+                for factor in src.overviews(band):
+                    height = max(1, math.ceil(src.height / factor))
+                    width = max(1, math.ceil(src.width / factor))
+                    src.read(
+                        band,
+                        out_shape=(height, width),
+                        resampling=Resampling.nearest,
+                    )
+
+        return True, None
+    except (rasterio.errors.RasterioError, OSError) as exc:
+        return False, str(exc)
 
 
-def cache_search(func):
-    if _cache_instance is None:
-        return func
-    return _cache_instance.cache_search(func)
+def validate_raster_open(path):
+    """Perform a lightweight raster structure check without reading pixel blocks."""
+    try:
+        with rasterio.open(path) as src:
+            if src.count < 1 or src.width < 1 or src.height < 1:
+                return False, "raster has no readable bands or pixels"
+        return True, None
+    except (rasterio.errors.RasterioError, OSError) as exc:
+        return False, str(exc)
+
+
+def _checksum_ledger_details(cache_root, cache_path):
+    """Map a DEA cache-relative asset path to its collection/tile ledger entry."""
+    parts = Path(cache_path).parts
+    if len(parts) < 7 or parts[0] != "dea-public-data":
+        return None
+
+    collection, path_number, row_number = parts[2:5]
+    if not path_number.isdigit() or not row_number.isdigit():
+        return None
+
+    ledger_path = (
+        Path(cache_root)
+        / "checksum-sha1"
+        / parts[0]
+        / parts[1]
+        / collection
+        / f"{path_number}_{row_number}.json"
+    )
+    entry_key = Path(*parts[5:]).as_posix()
+    return ledger_path, entry_key, collection, f"{path_number}_{row_number}"
+
+
+def _read_checksum_ledger(details):
+    """Read a tile ledger, returning an empty compatible ledger when unavailable."""
+    ledger_path, _, collection, tile = details
+    ledger = {
+        "version": 1,
+        "collection": collection,
+        "tile": tile,
+        "files": {},
+    }
+    if not ledger_path.is_file():
+        return ledger
+
+    try:
+        loaded = json.loads(ledger_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("checksum ledger root must be an object")
+        files = loaded.get("files")
+        if loaded.get("version") != 1 or not isinstance(files, dict):
+            raise ValueError("unsupported or malformed checksum ledger")
+        ledger["files"] = {
+            str(key): digest.lower()
+            for key, digest in files.items()
+            if isinstance(digest, str)
+            and len(digest) == 40
+            and all(character in "0123456789abcdefABCDEF" for character in digest)
+        }
+    except (OSError, UnicodeError, ValueError) as exc:
+        logger.warning("Invalid checksum ledger %s: %s", ledger_path, exc)
+    return ledger
+
+
+def _write_checksum_ledger(ledger_path, ledger):
+    """Durably and atomically write a collection/tile checksum ledger."""
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = ledger_path.with_suffix(f"{ledger_path.suffix}.{random.randint(100000, 999999)}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as stream:
+            json.dump(ledger, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        for attempt in range(5):
+            try:
+                tmp_path.replace(ledger_path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _sha1_file(path, chunk_size=8 * 1024 * 1024):
+    """Calculate a file SHA-1 using one sequential pass."""
+    digest = hashlib.sha1(usedforsecurity=False)
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def scrub_cache(
+    cache_root,
+    checkpoint_file=None,
+    corrupt_log=None,
+    partition_depth=7,
+    progress_interval=60,
+):
+    """
+    Validate every .tif, delete corrupt files, and ledger valid file SHA-1 digests.
+
+    A shallow, sequential walk yields directories at ``partition_depth`` as
+    work units. The default depth of 7 is the month directory in the DEA layout::
+
+        dea-public-data/<baseline|derivative>/<collection>/<path>/<row>/<year>/<month>
+
+    Completed units are checkpointed immediately. A restart therefore skips
+    completed months without descending into them and repeats at most the
+    interrupted month. Sequential reads avoid seek contention on a mechanical
+    cache drive.
+
+    Corrupt TIFFs are appended to the TSV log and flushed to disk before they
+    are deleted. A unit with a traversal, validation, or deletion error is not
+    checkpointed and will be retried by the next run. Valid TIFF checksums are
+    written to collection/tile ledgers below ``<cache_root>/checksum-sha1`` before their
+    work unit is checkpointed.
+
+    checkpoint_file   - JSON checkpoint; defaults to
+                        <cache_root>/audit_checkpoint.json
+    corrupt_log       - TSV file (path TAB error); defaults to
+                        <cache_root>/audit_corrupt.log
+    partition_depth   - work-unit depth (7 = month in the DEA layout)
+    progress_interval - seconds between progress messages; 0 disables them
+    """
+    checkpoint_version = 3
+    cache_root = Path(cache_root).resolve()
+    if not cache_root.is_dir():
+        raise NotADirectoryError(f"Cache root does not exist or is not a directory: {cache_root}")
+    if partition_depth < 0:
+        raise ValueError("partition_depth must be non-negative")
+    if progress_interval < 0:
+        raise ValueError("progress_interval must be non-negative")
+
+    checkpoint_file = (
+        Path(checkpoint_file) if checkpoint_file else cache_root / "audit_checkpoint.json"
+    )
+    corrupt_log = Path(corrupt_log) if corrupt_log else cache_root / "audit_corrupt.log"
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_log.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_root = os.path.normcase(str(cache_root))
+    excluded_directories = {"checksum-sha1", "stac-search-cache"}
+    checksum_ledgers = {}
+
+    def _work_unit_key(path):
+        return path.relative_to(cache_root).as_posix()
+
+    def _ledger_entry(path):
+        cache_path = path.relative_to(cache_root).as_posix()
+        details = _checksum_ledger_details(cache_root, cache_path)
+        if details is None:
+            return None, None
+        ledger_path = details[0]
+        ledger = checksum_ledgers.get(ledger_path)
+        if ledger is None:
+            ledger = _read_checksum_ledger(details)
+            checksum_ledgers[ledger_path] = ledger
+        return details, ledger
+
+    completed = set()
+    if checkpoint_file.exists():
+        try:
+            checkpoint = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Cannot read audit checkpoint {checkpoint_file}: {exc}") from exc
+
+        compatible = (
+            isinstance(checkpoint, dict)
+            and checkpoint.get("version") == checkpoint_version
+            and checkpoint.get("cache_root") == checkpoint_root
+            and checkpoint.get("partition_depth") == partition_depth
+            and isinstance(checkpoint.get("completed_units"), list)
+        )
+        if compatible:
+            completed = set(checkpoint["completed_units"])
+            logger.info(
+                "audit_cache: resuming with %d work units already verified",
+                len(completed),
+            )
+        else:
+            logger.warning(
+                "audit_cache: ignoring an incompatible checkpoint at %s",
+                checkpoint_file,
+            )
+
+    def _save_checkpoint():
+        checkpoint = {
+            "version": checkpoint_version,
+            "cache_root": checkpoint_root,
+            "partition_depth": partition_depth,
+            "completed_units": sorted(completed),
+        }
+        tmp = checkpoint_file.with_name(f"{checkpoint_file.name}.tmp")
+        with tmp.open("w", encoding="utf-8") as stream:
+            json.dump(checkpoint, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        for attempt in range(5):
+            try:
+                tmp.replace(checkpoint_file)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+
+    def _shallow_walk(root, target_depth):
+        """Yield directories at target_depth, or shallower leaf directories."""
+        stack = [(root, 0)]
+        while stack:
+            path, depth = stack.pop()
+            if depth == target_depth:
+                yield path
+                continue
+            try:
+                with os.scandir(path) as entries:
+                    subdirs = sorted(
+                        (
+                            Path(entry.path)
+                            for entry in entries
+                            if entry.is_dir(follow_symlinks=False)
+                            and entry.name not in excluded_directories
+                        ),
+                        key=lambda item: item.name.casefold(),
+                        reverse=True,
+                    )
+            except OSError as exc:
+                logger.error("audit_cache: cannot enumerate %s: %s", path, exc)
+                yield path
+                continue
+            if subdirs:
+                stack.extend((subdir, depth + 1) for subdir in subdirs)
+            else:
+                yield path
+
+    total_corrupt = 0
+    total_deleted = 0
+    total_files = 0
+    total_checksums = 0
+    total_errors = 0
+    completed_this_run = 0
+    incomplete_this_run = 0
+    skipped = 0
+    last_progress = time.monotonic()
+
+    def _log_progress(current_path, force=False):
+        nonlocal last_progress
+        now = time.monotonic()
+        if not force and (not progress_interval or now - last_progress < progress_interval):
+            return
+        logger.info(
+            "audit_cache: %d files checked, %d checksums recorded, %d units completed, "
+            "%d skipped, %d corrupt deleted, %d errors; current=%s",
+            total_files,
+            total_checksums,
+            completed_this_run,
+            skipped,
+            total_deleted,
+            total_errors,
+            current_path,
+        )
+        last_progress = now
+
+    def _validate_work_unit(work_unit, log_stream):
+        nonlocal total_checksums, total_corrupt, total_deleted, total_errors, total_files
+        unit_ok = True
+        dirty_ledgers = set()
+
+        def _walk_error(exc):
+            nonlocal unit_ok, total_errors
+            unit_ok = False
+            total_errors += 1
+            logger.error("audit_cache: cannot traverse %s: %s", work_unit, exc)
+
+        for root, dirs, files in os.walk(work_unit, onerror=_walk_error):
+            dirs[:] = sorted(
+                (directory for directory in dirs if directory not in excluded_directories),
+                key=str.casefold,
+            )
+            for name in sorted(files, key=str.casefold):
+                if Path(name).suffix.casefold() != ".tif":
+                    continue
+
+                path = Path(root, name)
+                total_files += 1
+                try:
+                    ok, error = validate_raster(path)
+                except Exception as exc:
+                    unit_ok = False
+                    total_errors += 1
+                    logger.exception(
+                        "audit_cache: unexpected validation error for %s: %s",
+                        path,
+                        exc,
+                    )
+                    _log_progress(path)
+                    continue
+
+                if not ok:
+                    total_corrupt += 1
+                    error = str(error or "unknown raster validation error").replace("\t", " ")
+                    error = " ".join(error.splitlines())
+                    log_stream.write(f"{path}\t{error}\n")
+                    log_stream.flush()
+                    os.fsync(log_stream.fileno())
+                    try:
+                        path.unlink()
+                    except OSError as exc:
+                        unit_ok = False
+                        total_errors += 1
+                        logger.error(
+                            "audit_cache: cannot delete corrupt TIFF %s: %s",
+                            path,
+                            exc,
+                        )
+                    else:
+                        total_deleted += 1
+                        logger.warning("audit_cache: deleted corrupt TIFF %s: %s", path, error)
+                    details, ledger = _ledger_entry(path)
+                    if details and ledger["files"].pop(details[1], None) is not None:
+                        dirty_ledgers.add(details[0])
+                else:
+                    details, ledger = _ledger_entry(path)
+                    if details is None:
+                        logger.debug(
+                            "audit_cache: no collection/tile checksum ledger mapping for %s",
+                            path,
+                        )
+                    else:
+                        try:
+                            digest = _sha1_file(path)
+                        except OSError as exc:
+                            unit_ok = False
+                            total_errors += 1
+                            logger.error("audit_cache: cannot checksum %s: %s", path, exc)
+                        else:
+                            if ledger["files"].get(details[1]) != digest:
+                                ledger["files"][details[1]] = digest
+                                dirty_ledgers.add(details[0])
+                            total_checksums += 1
+
+                _log_progress(path)
+
+        for ledger_path in sorted(dirty_ledgers):
+            try:
+                _write_checksum_ledger(ledger_path, checksum_ledgers[ledger_path])
+            except OSError as exc:
+                unit_ok = False
+                total_errors += 1
+                logger.error("audit_cache: cannot write checksum ledger %s: %s", ledger_path, exc)
+
+        return unit_ok
+
+    # Create the checkpoint and log immediately so the running audit is visible.
+    _save_checkpoint()
+    with corrupt_log.open("a", encoding="utf-8", buffering=1) as log_stream:
+        for work_unit in _shallow_walk(cache_root, partition_depth):
+            unit_key = _work_unit_key(work_unit)
+            if unit_key in completed:
+                skipped += 1
+                continue
+
+            if _validate_work_unit(work_unit, log_stream):
+                completed.add(unit_key)
+                completed_this_run += 1
+                _save_checkpoint()
+                logger.info("audit_cache: checkpointed completed unit %s", work_unit)
+            else:
+                incomplete_this_run += 1
+                logger.error(
+                    "audit_cache: not checkpointing incomplete unit %s; it will be retried",
+                    work_unit,
+                )
+
+    _log_progress(cache_root, force=True)
+    logger.info(
+        "audit_cache: pass finished - %d files checked, %d checksums recorded, "
+        "%d units completed, %d units incomplete, %d corrupt found, %d deleted; log=%s",
+        total_files,
+        total_checksums,
+        completed_this_run,
+        incomplete_this_run,
+        total_corrupt,
+        total_deleted,
+        corrupt_log,
+    )
+    return total_corrupt
 
 
 class RateLimiter:
@@ -197,7 +605,14 @@ class STACCache:
 
             self._url_map = OrderedDict()
             self._inflight = {}
+            self._asset_metadata = OrderedDict()
             self._lock = threading.Lock()
+            self._manifest_cache = {}
+            self._manifest_inflight = {}
+            self._manifest_lock = threading.Lock()
+            self._checksum_ledgers = {}
+            self._dirty_checksum_ledgers = set()
+            self._checksum_ledger_lock = threading.RLock()
 
             self._limiter = RateLimiter(max_rate_mb)
 
@@ -442,15 +857,6 @@ class STACCache:
                     logger.warning(f"Error closing cache instance: {e}")
             cls._instance = None
 
-    def __enter__(self):
-        """Support 'with STACCache() as cache:' syntax."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Ensure clean shutdown on context exit."""
-        self.close()
-        return False
-
     def _check_fallback(self, url):
         """
         Check if URL exists in fallback cache chain.
@@ -544,7 +950,7 @@ class STACCache:
     def _url_to_path(url):
         """
         Normalise any DEA URL form to a local path structure including the bucket name.
-        e.g. s3://dea-public-data/baseline/... -> dea-public-data/baseline/...
+        e.g. s3://dea-public-data/... -> dea-public-data/...
         """
         if "data.dea.ga.gov.au" in url:
             return url.replace("https://data.dea.ga.gov.au/", "dea-public-data/")
@@ -553,6 +959,217 @@ class STACCache:
             return url.replace("s3://", "")
 
         return url
+
+    @staticmethod
+    def _https_url(url, cache_path):
+        """Convert a DEA S3 asset URL to the public HTTPS endpoint."""
+        if cache_path.startswith("dea-public-data/"):
+            relative_path = cache_path.removeprefix("dea-public-data/")
+            return f"https://data.dea.ga.gov.au/{relative_path}"
+        if url.startswith("http"):
+            return url
+        return f"https://data.dea.ga.gov.au/{cache_path}"
+
+    @staticmethod
+    def _parse_sha1_manifest(text):
+        """Parse a DEA SHA-1 manifest into a filename-to-digest mapping."""
+        checksums = {}
+        for line_number, raw_line in enumerate(text.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                digest, filename = line.split(maxsplit=1)
+            except ValueError as exc:
+                raise ValueError(f"invalid SHA-1 manifest line {line_number}") from exc
+            digest = digest.lower()
+            if len(digest) != 40 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError(f"invalid SHA-1 digest on manifest line {line_number}")
+            filename = filename.strip().lstrip("*")
+            if not filename:
+                raise ValueError(f"missing filename on manifest line {line_number}")
+            checksums[Path(filename).name] = digest
+
+        if not checksums:
+            raise ValueError("SHA-1 manifest contains no file entries")
+        return checksums
+
+    def _load_checksum_manifest(self, manifest_url):
+        """Fetch and parse a DEA checksum manifest without persisting it in the asset tree."""
+        cache_path = self._url_to_path(manifest_url)
+        request_url = self._https_url(manifest_url, cache_path)
+        headers = {
+            "Cache-Control": "no-cache, no-store, max-age=0",
+            "Pragma": "no-cache",
+        }
+        content = bytearray()
+        with requests.get(
+            request_url,
+            headers=headers,
+            stream=True,
+            timeout=self._timeout,
+        ) as response:
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                self._limiter.consume(len(chunk))
+                content.extend(chunk)
+
+        return self._parse_sha1_manifest(content.decode("utf-8"))
+
+    def _refresh_checksum_manifest(self, manifest_url):
+        """Fetch the current DEA manifest, bypassing disk and in-memory copies."""
+        try:
+            manifest = self._load_checksum_manifest(manifest_url, refresh=True)
+        except Exception as exc:
+            logger.warning("Unable to refresh SHA-1 manifest %s: %s", manifest_url, exc)
+            return None
+
+        with self._manifest_lock:
+            self._manifest_cache[manifest_url] = manifest
+        return manifest
+
+    def _get_checksum_manifest(self, manifest_url):
+        """Return a parsed manifest, allowing only one fetch per URL at a time."""
+        with self._manifest_lock:
+            if manifest_url in self._manifest_cache:
+                return self._manifest_cache[manifest_url]
+            event = self._manifest_inflight.get(manifest_url)
+            owner = event is None
+            if owner:
+                event = threading.Event()
+                self._manifest_inflight[manifest_url] = event
+
+        if not owner:
+            event.wait()
+            with self._manifest_lock:
+                return self._manifest_cache.get(manifest_url)
+
+        manifest = None
+        try:
+            manifest = self._load_checksum_manifest(manifest_url)
+        except Exception as exc:
+            logger.warning("Unable to load SHA-1 manifest %s: %s", manifest_url, exc)
+        finally:
+            with self._manifest_lock:
+                self._manifest_cache[manifest_url] = manifest
+                self._manifest_inflight.pop(manifest_url).set()
+
+        return manifest
+
+    def _checksum_ledger_details(self, url):
+        """Map a DEA Landsat asset URL to its collection/tile ledger and entry key."""
+        return _checksum_ledger_details(self.cache_root, self._url_to_path(url))
+
+    def _load_checksum_ledger(self, details):
+        """Load one tile ledger once, returning an empty ledger for missing/invalid files."""
+        ledger_path = details[0]
+        with self._checksum_ledger_lock:
+            ledger = self._checksum_ledgers.get(ledger_path)
+            if ledger is not None:
+                return ledger
+
+            ledger = _read_checksum_ledger(details)
+            self._checksum_ledgers[ledger_path] = ledger
+            return ledger
+
+    def _read_asset_checksum(self, url):
+        """Read a cached digest without accessing the deeply nested asset directory."""
+        details = self._checksum_ledger_details(url)
+        if details is None:
+            return None
+        ledger = self._load_checksum_ledger(details)
+        with self._checksum_ledger_lock:
+            return ledger["files"].get(details[1])
+
+    def _record_asset_checksum(self, url, digest):
+        """Record a validated digest in the in-memory collection/tile ledger."""
+        details = self._checksum_ledger_details(url)
+        if details is None:
+            logger.debug("No collection/tile checksum ledger mapping for %s", url)
+            return
+        ledger = self._load_checksum_ledger(details)
+        with self._checksum_ledger_lock:
+            ledger["files"][details[1]] = digest.lower()
+            self._dirty_checksum_ledgers.add(details[0])
+
+    def _remove_asset_checksum(self, url):
+        """Remove a stale digest from its in-memory ledger."""
+        details = self._checksum_ledger_details(url)
+        if details is None:
+            return
+        ledger = self._load_checksum_ledger(details)
+        with self._checksum_ledger_lock:
+            if ledger["files"].pop(details[1], None) is not None:
+                self._dirty_checksum_ledgers.add(details[0])
+
+    def _flush_checksum_ledgers(self):
+        """Atomically flush dirty tile ledgers, normally once the download queue is idle."""
+        if self.readonly:
+            return
+        with self._checksum_ledger_lock:
+            for ledger_path in list(self._dirty_checksum_ledgers):
+                ledger = self._checksum_ledgers[ledger_path]
+                try:
+                    _write_checksum_ledger(ledger_path, ledger)
+                    self._dirty_checksum_ledgers.discard(ledger_path)
+                except OSError as exc:
+                    logger.warning("Unable to write checksum ledger %s: %s", ledger_path, exc)
+
+    def _reconcile_asset_checksums(self, assets):
+        """Remove cached TIFFs only when fresh and recorded SHA-1 digests disagree."""
+        manifest_urls = sorted({asset[2] for asset in assets if asset[2]})
+        manifests = {}
+
+        if manifest_urls:
+            worker_count = min(max(1, self.workers), 8, len(manifest_urls))
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(self._refresh_checksum_manifest, url): url
+                    for url in manifest_urls
+                }
+                for future in as_completed(futures):
+                    manifest_url = futures[future]
+                    try:
+                        manifests[manifest_url] = future.result()
+                    except Exception as exc:
+                        logger.warning(
+                            "Unable to reconcile SHA-1 manifest %s: %s", manifest_url, exc
+                        )
+                        manifests[manifest_url] = None
+
+        reconciled = []
+        for priority, url, checksum_url, expected_size in assets:
+            local_path = self.cache_root / Path(self._url_to_path(url))
+            manifest = manifests.get(checksum_url)
+            expected_sha1 = manifest.get(local_path.name) if manifest else None
+            cached_sha1 = self._read_asset_checksum(url)
+
+            if expected_sha1 and cached_sha1 and expected_sha1 != cached_sha1:
+                try:
+                    local_path.unlink(missing_ok=True)
+                    self._remove_asset_checksum(url)
+                    with self._lock:
+                        self._url_map.pop(url, None)
+                    logger.warning(
+                        "Deleted stale cached TIFF %s: cached SHA-1 %s differs from DEA %s",
+                        local_path,
+                        cached_sha1,
+                        expected_sha1,
+                    )
+                except OSError as exc:
+                    logger.error("Unable to delete stale cached TIFF %s: %s", local_path, exc)
+
+            with self._lock:
+                metadata = self._asset_metadata.get(url)
+                if metadata is not None:
+                    metadata["expected_sha1"] = expected_sha1
+            reconciled.append((priority, url, checksum_url, expected_size, expected_sha1))
+
+        return reconciled
 
     def _cleanup_local_stale_tmp(self, dir_path, max_age=86400):
         """
@@ -579,7 +1196,15 @@ class STACCache:
         except OSError:
             pass
 
-    def _download_asset(self, url, priority=None, max_retries=3):
+    def _download_asset(
+        self,
+        url,
+        priority=None,
+        max_retries=3,
+        checksum_url=None,
+        expected_size=None,
+        expected_sha1=None,
+    ):
         """
         Download a single asset via HTTPS with atomic write and retries.
 
@@ -604,32 +1229,58 @@ class STACCache:
                 self.enabled = False
                 return url, url
 
-            tmp_dest = local_dest.with_suffix(f".{random.randint(100000, 999999)}.tmp")
+            if expected_size is not None:
+                try:
+                    expected_size = int(expected_size)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Ignoring invalid expected size for %s: %r", s3_path, expected_size
+                    )
+                    expected_size = None
+            if expected_sha1 is not None:
+                expected_sha1 = str(expected_sha1).lower()
+            elif checksum_url:
+                manifest = self._get_checksum_manifest(checksum_url)
+                if manifest:
+                    expected_sha1 = manifest.get(local_dest.name)
+                    if not expected_sha1:
+                        logger.warning(
+                            "SHA-1 manifest has no entry for %s; using lightweight open check",
+                            s3_path,
+                        )
 
-            # Construct HTTPS URL
-            if s3_path.startswith("dea-public-data/"):
-                https_url = (
-                    f"https://data.dea.ga.gov.au/{s3_path.replace('dea-public-data/', '', 1)}"
-                )
-            elif url.startswith("http"):
-                https_url = url
-            else:
-                https_url = f"https://data.dea.ga.gov.au/{s3_path}"
+            tmp_dest = local_dest.with_suffix(f".{random.randint(100000, 999999)}.tmp")
+            https_url = self._https_url(url, s3_path)
 
             for attempt in range(max_retries):
                 try:
                     p_str = f" [p={priority}]" if priority is not None else ""
-                    logger.debug(
+                    log = logger.warning if attempt > 1 else logger.debug
+                    log(
                         f"Downloading{p_str}: {s3_path} (Attempt {attempt + 1}) "
                         f"[thread={threading.current_thread().name}]"
                     )
                     t0 = time.time()
 
+                    request_url = https_url
+
+                    if attempt > 0:
+                        request_url = f"{https_url}?cachebreaker={attempt}"
+
+                    headers = {
+                        "Cache-Control": "no-cache, no-store, max-age=0",
+                        "Pragma": "no-cache",
+                    }
+
                     # 10s connect timeout, 300s read timeout
                     # Read timeout is generous: 24 threads sharing ~100 Mbps means
                     # each thread gets ~4 Mbps — a 50 MB file can take 100s+ between chunks.
                     chunk_sz = 1024 * 1024 if self._limiter.rate_per_sec > 0 else 8 * 1024 * 1024
-                    with requests.get(https_url, stream=True, timeout=self._timeout) as resp:
+                    sha1 = hashlib.sha1(usedforsecurity=False) if expected_sha1 else None
+                    downloaded_bytes = 0
+                    with requests.get(
+                        request_url, headers=headers, stream=True, timeout=self._timeout
+                    ) as resp:
                         resp.raise_for_status()
                         with open(tmp_dest, "wb") as local_f:
                             for chunk in resp.iter_content(chunk_size=chunk_sz):
@@ -638,10 +1289,39 @@ class STACCache:
 
                                 self._limiter.consume(len(chunk))
                                 local_f.write(chunk)
+                                downloaded_bytes += len(chunk)
+                                if sha1:
+                                    sha1.update(chunk)
+
+                    if expected_size is not None and downloaded_bytes != expected_size:
+                        raise OSError(
+                            f"Downloaded size mismatch for {s3_path}: "
+                            f"expected {expected_size}, got {downloaded_bytes} bytes"
+                        )
+
+                    if expected_sha1:
+                        actual_sha1 = sha1.hexdigest()
+                        if actual_sha1 != expected_sha1:
+                            raise OSError(
+                                f"SHA-1 mismatch for {s3_path}: "
+                                f"expected {expected_sha1}, got {actual_sha1}"
+                            )
+                        logger.debug("SHA-1 verified: %s", s3_path)
+                    else:
+                        valid, error = validate_raster_open(tmp_dest)
+                        if not valid:
+                            raise OSError(f"Raster open validation failed for {s3_path}: {error}")
+                        logger.info(
+                            "No SHA-1 checksum available for %s; "
+                            "passed lightweight raster open check",
+                            s3_path,
+                        )
 
                     # Atomic rename — no lock needed: tmp name is unique per thread,
                     # and replace() is atomic on NTFS.
                     tmp_dest.replace(local_dest)
+                    if expected_sha1:
+                        self._record_asset_checksum(url, expected_sha1)
                     # Self-cleaning: remove stale .tmp files in this specific directory
                     self._cleanup_local_stale_tmp(local_dest.parent)
 
@@ -743,6 +1423,9 @@ class STACCache:
             # Remove from inflight tracking
             if url in self._inflight:
                 del self._inflight[url]
+            queue_idle = not self._inflight
+        if queue_idle:
+            self._flush_checksum_ledgers()
         logger.debug(f"Download completed: {url} -> {path}")
 
     def _safe_callback(self, url, future):
@@ -780,14 +1463,34 @@ class STACCache:
                 if priority is None:
                     continue
 
+            checksum_asset = item.assets.get("checksum:sha1")
+            checksum_url = getattr(checksum_asset, "href", None)
             asset_keys = bands if bands is not None else list(item.assets.keys())
             for band in asset_keys:
+                if band == "checksum:sha1":
+                    continue
                 if band in item.assets:
                     url = item.assets[band].href
                     if url not in seen:
                         seen.add(url)
-                        assets.append((priority, url))
                         size = item.assets[band].extra_fields.get("file:size")
+                        try:
+                            size = int(size) if size is not None else None
+                        except (TypeError, ValueError):
+                            logger.warning("Ignoring invalid file:size for %s: %r", url, size)
+                            size = None
+                        assets.append((priority, url, checksum_url, size))
+                        with self._lock:
+                            while (
+                                len(self._asset_metadata) >= self._url_list_capacity
+                                and url not in self._asset_metadata
+                            ):
+                                self._asset_metadata.popitem(last=False)
+                            self._asset_metadata[url] = {
+                                "checksum_url": checksum_url,
+                                "expected_size": size,
+                            }
+                            self._asset_metadata.move_to_end(url)
                         if size:
                             total_bytes += size
         return assets, total_bytes
@@ -818,7 +1521,7 @@ class STACCache:
         for i in assets_to_download:
             logger.debug(f"Priority: {i[0]}, URL: {i[1]}")
 
-        for priority, url in assets_to_download:
+        for priority, url, _checksum_url, expected_size, expected_sha1 in assets_to_download:
             with self._lock:
                 # Skip already cached
                 if url in self._url_map:
@@ -827,7 +1530,13 @@ class STACCache:
                 if url in self._inflight:
                     continue
                 # Submit download with priority metadata
-                fut = self._executor.submit(self._download_asset, url, priority=priority)
+                fut = self._executor.submit(
+                    self._download_asset,
+                    url,
+                    priority=priority,
+                    expected_size=expected_size,
+                    expected_sha1=expected_sha1,
+                )
                 self._inflight[url] = (
                     fut,
                     priority,
@@ -870,6 +1579,7 @@ class STACCache:
 
         seen = set()
         assets, total_bytes = self._gather_assets(items, bands, intersection_filter, seen)
+        assets = self._reconcile_asset_checksums(assets)
         self._submit_assets(assets, total_bytes)
 
     def submit_batches(self, batches, intersection_filter=None):
@@ -922,6 +1632,7 @@ class STACCache:
             except Exception as e:
                 logger.warning(f"Error gathering assets for batch {i}: {e}")
 
+        all_assets = self._reconcile_asset_checksums(all_assets)
         self._submit_assets(all_assets, total_bytes)
 
     def patch_url(self, url, timeout=3):
@@ -995,7 +1706,13 @@ class STACCache:
 
             if not inflight:
                 # Not cached, not inflight → submit background download
-                fut = self._executor.submit(self._download_asset, url)
+                metadata = self._asset_metadata.get(url, {})
+                fut = self._executor.submit(
+                    self._download_asset,
+                    url,
+                    expected_size=metadata.get("expected_size"),
+                    expected_sha1=metadata.get("expected_sha1"),
+                )
                 self._inflight[url] = (fut, None)
                 fut.add_done_callback(lambda f, u=url: self._safe_callback(u, f))
                 logger.debug(f"patch_url MISS and REQUESTED: {url}")
@@ -1086,216 +1803,6 @@ class STACCache:
                     pass
 
         return deleted
-
-    def info(self):
-        """
-        Diagnostics: Parallelized for NAS performance.
-        Calculates disk usage, cache footprint, age distribution, and collection breakdown.
-        """
-        print(f"\n--- Cache Info: {self.cache_root} ---")
-
-        if not self.cache_root.exists():
-            print("Cache directory does not exist.")
-            return
-
-        # 1. Disk health (Fast, single syscall)
-        try:
-            total, used, free = shutil.disk_usage(self.cache_root)
-            print(
-                f"Disk: Total={total / (1 << 40):.1f} TB, "
-                f"Used={used / (1 << 40):.1f} TB ({used / total * 100:.0f}%), "
-                f"Free={free / (1 << 40):.1f} TB"
-            )
-        except Exception as e:
-            print(f"Disk usage check failed: {e}")
-
-        now = time.time()
-
-        # 2. Define the worker function for parallel execution
-        def _scan_chunk(start_path):
-            """
-            Scans a directory tree serially and returns aggregated stats.
-            This runs inside a thread.
-            """
-            local_stats = {
-                "age_buckets": defaultdict(int),
-                "transient_counts": defaultdict(int),
-                "transient_ages": [],
-                "collections": defaultdict(int),
-                "unclassified_files": 0,
-                "total_files": 0,
-                "total_bytes": 0,
-            }
-
-            # Stack-based iteration to avoid recursion limits on deep trees
-            stack = [start_path]
-
-            while stack:
-                current_path = stack.pop()
-                try:
-                    # os.scandir is much faster on NAS than os.walk or Path.glob
-                    with os.scandir(current_path) as it:
-                        for entry in it:
-                            if entry.is_dir(follow_symlinks=False):
-                                stack.append(entry.path)
-                                continue
-
-                            if not entry.is_file(follow_symlinks=False):
-                                continue
-
-                            # On Linux/Windows, entry.stat() is usually cached from scandir
-                            try:
-                                st = entry.stat()
-                                size = st.st_size
-                                mtime = st.st_mtime
-                                name = entry.name
-                            except OSError:
-                                continue
-
-                            # --- Aggregation Logic ---
-                            local_stats["total_files"] += 1
-                            local_stats["total_bytes"] += size
-
-                            # Transient checks
-                            if name.endswith(".lock"):
-                                local_stats["transient_counts"]["lock"] += 1
-                                continue
-                            if name.endswith(".tmp"):
-                                local_stats["transient_counts"]["tmp"] += 1
-                                local_stats["transient_ages"].append(now - mtime)
-                                continue
-
-                            # Age buckets
-                            age_days = (now - mtime) / 86400
-                            if age_days < 7:
-                                local_stats["age_buckets"]["<7d"] += 1
-                            elif age_days < 30:
-                                local_stats["age_buckets"]["7-30d"] += 1
-                            elif age_days < 180:
-                                local_stats["age_buckets"]["1-6mo"] += 1
-                            else:
-                                local_stats["age_buckets"][">6mo"] += 1
-
-                            # Collection classification (Optimized string parsing)
-                            # Path: .../baseline/COLLECTION_NAME/...
-                            try:
-                                path_str = entry.path
-                                if "baseline" in path_str:
-                                    # Fast string splitting
-                                    parts = path_str.split(os.sep)
-                                    if "baseline" in parts:
-                                        idx = parts.index("baseline")
-                                        if idx + 1 < len(parts):
-                                            col = parts[idx + 1]
-                                            local_stats["collections"][col] += size
-                                            continue
-                                local_stats["unclassified_files"] += 1
-                            except Exception:
-                                local_stats["unclassified_files"] += 1
-
-                except OSError:
-                    # Permission denied or path disappeared
-                    pass
-
-            return local_stats
-
-        # 3. Prepare Work Chunks
-        # Drill down to find enough distinct subdirectories to parallelize effectively.
-        # We aim to split until we have enough chunks to saturate threads, or hit a specific depth.
-        scan_targets = [self.cache_root]
-        target_chunk_count = 64  # Aim for plenty of chunks (4x workers) to balance load
-        max_split_depth = 4  # User indicated structure becomes meaningful at level 3
-
-        print("Discovering scan targets...")
-
-        current_depth = 0
-        while current_depth < max_split_depth and len(scan_targets) < target_chunk_count:
-            next_targets = []
-            expanded_any = False
-
-            for path in scan_targets:
-                try:
-                    # We only care about directories for splitting work
-                    is_leaf = True
-                    with os.scandir(path) as it:
-                        for entry in it:
-                            if entry.is_dir(follow_symlinks=False):
-                                next_targets.append(entry.path)
-                                is_leaf = False
-                                expanded_any = True
-
-                    # If no subdirectories found, this path is a work unit (leaf or files-only)
-                    if is_leaf:
-                        next_targets.append(path)
-
-                except OSError:
-                    # If we can't read it now, keep it so the worker logs the error
-                    next_targets.append(path)
-
-            if not expanded_any:
-                break
-
-            scan_targets = next_targets
-            current_depth += 1
-
-        print(f"Identified {len(scan_targets)} scan targets at depth {current_depth}.")
-
-        # 4. Execute Parallel Scan
-        # 16-32 workers is usually the sweet spot for NAS latency hiding.
-        # Too many will thrash the disk I/O; too few won't hide network latency.
-        final_stats = {
-            "age_buckets": defaultdict(int),
-            "transient_counts": defaultdict(int),
-            "transient_ages": [],
-            "collections": defaultdict(int),
-            "unclassified_files": 0,
-            "total_files": 0,
-            "total_bytes": 0,
-        }
-
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            future_to_path = {executor.submit(_scan_chunk, p): p for p in scan_targets}
-
-            for future in as_completed(future_to_path):
-                try:
-                    data = future.result()
-                    # Merge results
-                    final_stats["total_files"] += data["total_files"]
-                    final_stats["total_bytes"] += data["total_bytes"]
-                    final_stats["unclassified_files"] += data["unclassified_files"]
-                    final_stats["transient_ages"].extend(data["transient_ages"])
-
-                    for k, v in data["age_buckets"].items():
-                        final_stats["age_buckets"][k] += v
-                    for k, v in data["transient_counts"].items():
-                        final_stats["transient_counts"][k] += v
-                    for k, v in data["collections"].items():
-                        final_stats["collections"][k] += v
-
-                except Exception as exc:
-                    print(f"Worker failed: {exc}")
-
-        # 5. Print Summary
-        print(
-            f"\nCache: {final_stats['total_bytes'] / (1 << 30):.2f} GB, {final_stats['total_files']} files"
-        )
-        print("File age distribution:", dict(final_stats["age_buckets"]))
-        print("Collection footprint (GB):")
-
-        for col, sz in sorted(final_stats["collections"].items(), key=lambda x: x[1], reverse=True):
-            print(f"  {col}: {sz / (1 << 30):.2f}")
-
-        oldest_tmp = max(final_stats["transient_ages"]) if final_stats["transient_ages"] else 0
-        oldest_str = (
-            f"{int(oldest_tmp // 3600)}h {int((oldest_tmp % 3600) // 60)}m" if oldest_tmp else "N/A"
-        )
-        print(
-            f"Transient files: Lock={final_stats['transient_counts']['lock']}, "
-            f"Temp={final_stats['transient_counts']['tmp']} (oldest {oldest_str})"
-        )
-        if final_stats["unclassified_files"]:
-            print(f"Unclassified files: {final_stats['unclassified_files']}")
-        print("-----------------------------------")
 
     def cache_search(self, func):
         """
@@ -1458,7 +1965,30 @@ class STACCache:
         return wrapper
 
     def close(self):
-        """Shut down the thread pool executor."""
+        """Finish downloads, persist checksum ledgers, and shut down the executor."""
         if hasattr(self, "_executor") and self._executor:
             self._executor.shutdown(wait=True)
             logger.info("STACCache executor shut down")
+        if hasattr(self, "_dirty_checksum_ledgers"):
+            self._flush_checksum_ledgers()
+
+    def __enter__(self):
+        """Support 'with STACCache() as cache:' syntax."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Ensure clean shutdown on context exit."""
+        self.close()
+        return False
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    scrub_cache("z:/dea-local-cache")
+
+
+if __name__ == "__main__":
+    main()
