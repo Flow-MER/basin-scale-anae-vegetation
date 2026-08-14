@@ -72,7 +72,6 @@ except ImportError:
 def _noop_decorator(func):
     return func
 
-
 _instance = STACCache.get_instance() if STACCache else None
 cache_search = _instance.cache_search if _instance else _noop_decorator
 ###################################################
@@ -595,7 +594,7 @@ def load_landsat_macro(items, geobox, macro_id, year, month, config):
             geobox=geobox,
             groupby="solar_day",
             chunks={"time": 1, "x": config.tile_pixels, "y": config.tile_pixels},
-            fail_on_error=False,
+            fail_on_error=True,
             patch_url=patch_url,
         )
     except Exception as e:
