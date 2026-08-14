@@ -36,3 +36,4 @@ output-2yr-trend/
 *.csv
 
 stac_cache.py
+tests\test_stac_cache.py
