@@ -21,7 +21,7 @@ class SpatialDataManager:
     Handles ANAE polygons and spatial joins for different aggregation levels.
     """
 
-    def __init__(self, config: VegetationConfig, anae_cache: Path = None):
+    def __init__(self, config: VegetationConfig, anae_cache: Path | None = None) -> None:
         self.config = config
 
         # Try to load from cache if provided
@@ -29,7 +29,7 @@ class SpatialDataManager:
             try:
                 self._load_cached_anae(anae_cache)
             except Exception as e:
-                logger.warning(f"Failed to load cache {anae_cache}: {e}")
+                logger.warning("Failed to load cache %s: %s", anae_cache, e)
                 self.anae_gdf = None
                 self.aggregators = {}
                 self.agg_fields = {}
@@ -38,14 +38,14 @@ class SpatialDataManager:
             self.aggregators = {}
             self.agg_fields = {}
 
-    def _load_cached_anae(self, anae_cache: Path):
+    def _load_cached_anae(self, anae_cache: Path) -> None:
         """
         Loads cached ANAE data with optimized data types.
 
         Args:
             anae_cache (Path): Path to cached ANAE parquet file
         """
-        logger.info(f"Loading cached ANAE data from {anae_cache}")
+        logger.info("Loading cached ANAE data from %s", anae_cache)
         self.anae_gdf = gpd.read_parquet(anae_cache)
 
         # Optimize data types for memory efficiency
@@ -69,7 +69,7 @@ class SpatialDataManager:
         required_cols = ["UID", "Area_Ha", "grp"] + all_agg_cols
         self._validate_columns(self.anae_gdf, required_cols, anae_cache)
 
-    def _assign_group_name(self, anae_type):
+    def _assign_group_name(self, anae_type: str) -> str | None:
         """
         Maps ANAE types to functional groups using configuration.
 
@@ -82,7 +82,7 @@ class SpatialDataManager:
         anae_type = str(anae_type).lower()
         return self.config.anae_groupings.get(anae_type)
 
-    def _validate_columns(self, gdf, columns, gdf_path):
+    def _validate_columns(self, gdf: gpd.GeoDataFrame, columns: list[str], gdf_path: Path) -> None:
         """
         Validates that required columns exist in the GeoDataFrame.
 
@@ -98,7 +98,7 @@ class SpatialDataManager:
         if missing_cols:
             raise Exception(f"Missing columns {missing_cols} in {gdf_path}. Required: {columns}")
 
-    def load_anae(self):
+    def load_anae(self) -> None:
         """
         Loads ANAE shapefile and sets up aggregation hierarchies.
         Optimizes memory usage through selective column loading and categorical data types.
@@ -129,7 +129,7 @@ class SpatialDataManager:
         # Set up aggregation hierarchies
         self._setup_aggregators()
 
-    def _setup_aggregators(self):
+    def _setup_aggregators(self) -> None:
         """
         Sets up spatial aggregation hierarchies with memory-efficient indexing.
         """
@@ -148,7 +148,12 @@ class SpatialDataManager:
         self.aggregators["ANAE"].name = "ANAE"
         self.agg_fields["ANAE"] = ["UID"]
 
-    def load_data(self, spatial_aggregator_shape_file, name=None, unique_id=None):
+    def load_data(
+        self,
+        spatial_aggregator_shape_file: Path,
+        name: str | None = None,
+        unique_id: str | list[str] | None = None,
+    ) -> gpd.GeoDataFrame:
         """
         Loads additional spatial aggregation layers with memory-optimized spatial joins.
 
@@ -174,7 +179,7 @@ class SpatialDataManager:
             if not spatial_aggregator_shape_file.exists():
                 raise FileNotFoundError(f"Shapefile not found: {spatial_aggregator_shape_file}")
 
-            logger.info(f"Loading spatial aggregator: {spatial_aggregator_shape_file.name}")
+            logger.info("Loading spatial aggregator: %s", spatial_aggregator_shape_file.name)
             self.agg_fields[name] = unique_id
 
             # Load only required columns to minimize memory usage
@@ -203,14 +208,14 @@ class SpatialDataManager:
             return gdf_sj
 
         except Exception as e:
-            logger.error(f"Error loading spatial aggregator {name}: {e}")
+            logger.error("Error loading spatial aggregator %s: %s", name, e)
             raise
 
 
 class BaseDataLoader:
     """Base class for data loaders with common functionality."""
 
-    def __init__(self, config: VegetationConfig):
+    def __init__(self, config: VegetationConfig) -> None:
         self.config = config
 
 
@@ -219,7 +224,7 @@ class WitMetricsLoader(BaseDataLoader):
     Loads WIT (Wetland Insights Tool) metrics with memory optimizations.
     """
 
-    def load_data(self, uid_dtype):
+    def load_data(self, uid_dtype: pd.CategoricalDtype) -> pd.DataFrame:
         """
         Loads WIT metrics data filtered by valid UIDs.
 
@@ -233,7 +238,7 @@ class WitMetricsLoader(BaseDataLoader):
             ValueError: If no data found for specified UIDs
             KeyError: If required columns are missing
         """
-        logger.info(f"Loading WIT metrics from {self.config.wit_metrics_zip}")
+        logger.info("Loading WIT metrics from %s", self.config.wit_metrics_zip)
 
         try:
             # Load data with optimized data types any UID not in uid_dtype will become NaN and dropped
@@ -243,7 +248,7 @@ class WitMetricsLoader(BaseDataLoader):
             ).rename(columns={"feature_id": "UID"})
 
         except Exception as e:
-            logger.error(f"Error reading WIT metrics: {e}")
+            logger.error("Error reading WIT metrics: %s", e)
             raise
 
         # Validate required columns
@@ -267,7 +272,7 @@ class TsliLoader(BaseDataLoader):
     Loads Time Since Last Inundation (TSLI) data with memory optimizations.
     """
 
-    def load_data(self, uid_dtype):
+    def load_data(self, uid_dtype: pd.CategoricalDtype) -> pd.DataFrame:
         """
         Loads inundation event data for TSLI calculation.
 
@@ -277,7 +282,7 @@ class TsliLoader(BaseDataLoader):
         Returns:
             pd.DataFrame: Inundation events with duration and gap in days
         """
-        logger.info(f"Loading inundation metrics from {self.config.wit_inundation_zip}")
+        logger.info("Loading inundation metrics from %s", self.config.wit_inundation_zip)
         try:
             # Load with optimized parsing
             inundation_df = pd.read_csv(
@@ -287,7 +292,7 @@ class TsliLoader(BaseDataLoader):
             ).rename(columns={"feature_id": "UID"})
 
         except Exception as e:
-            logger.error(f"Error reading inundation metrics: {e}")
+            logger.error("Error reading inundation metrics: %s", e)
             raise
 
         if inundation_df.empty:
@@ -308,7 +313,7 @@ class NdviLoader(BaseDataLoader):
     Loads NDVI data with memory-optimized interpolation for missing values.
     """
 
-    def _complete_time_index(df):
+    def _complete_time_index(df: pd.DataFrame) -> pd.DataFrame:
         # Create full date range
         full_dates = pd.date_range(df["date"].min(), df["date"].max(), freq="M")
 
@@ -322,7 +327,9 @@ class NdviLoader(BaseDataLoader):
 
         return df
 
-    def load_data(self, uid_dtype, needed_cols=None):
+    def load_data(
+        self, uid_dtype: pd.CategoricalDtype, needed_cols: list[str] | None = None
+    ) -> pd.DataFrame:
         """
         Loads and interpolates NDVI data with memory-efficient processing.
         Uses chunked processing to avoid loading all files simultaneously.
@@ -334,7 +341,7 @@ class NdviLoader(BaseDataLoader):
             pd.DataFrame: NDVI data with interpolated missing values
         """
 
-        logger.info(f"Loading NDVI data from {self.config.ndvi_path}")
+        logger.info("Loading NDVI data from %s", self.config.ndvi_path)
         if needed_cols is None:
             needed_cols = needed_cols or ["UID", "year", "month", "ndvi"]
 
@@ -391,7 +398,9 @@ class SoilMoistureLoader(BaseDataLoader):
     Loads soil moisture data with memory optimizations.
     """
 
-    def load_data(self, uid_dtype, needed_cols=None):
+    def load_data(
+        self, uid_dtype: pd.CategoricalDtype, needed_cols: list[str] | None = None
+    ) -> pd.DataFrame:
         """
         Loads soil moisture data filtered by valid UIDs.
 

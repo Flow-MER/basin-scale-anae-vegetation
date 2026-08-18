@@ -7,7 +7,12 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
-def setup_logging(log_dir, script_name, file_level=logging.DEBUG, console_level=logging.INFO):
+def setup_logging(
+    log_dir: Path,
+    script_name: str,
+    file_level: int = logging.DEBUG,
+    console_level: int = logging.INFO,
+) -> None:
     """
     Configure logging to file and console.
 
@@ -47,9 +52,8 @@ def setup_logging(log_dir, script_name, file_level=logging.DEBUG, console_level=
     console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 
     root_logger.addHandler(console_handler)
+    root_logger.info("Logging to: %s", log_file)
 
     # Rasterio emits very verbose internal GDAL diagnostics when the root logger
     # is at DEBUG. Keep actionable warnings and errors without flooding log files.
     logging.getLogger("rasterio").setLevel(logging.WARNING)
-
-    logging.info(f"Logging to: {log_file}")

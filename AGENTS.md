@@ -1,5 +1,11 @@
 # Agent Execution Policy
 
+## Prime Directive
+
+Do not proceed with work when there are unanswered questions.
+
+If you have questions, stop as soon as you have them and ask before proceeding. Do not guess, do not fill in missing requirements silently, and do not continue implementation while a decision is unclear.
+
 ## File Operations
 
 - Write all temporary/patch/debug files to `.tmp/` only
@@ -23,6 +29,6 @@ Do NOT auto-apply `strict=True`. First confirm the zipped iterables are guarante
 
 Reply with a structured block:
 
-- **Files modified:** <list>
-- **Ruff:** <pass/fail + any warnings>
-- **verify.py:** <pass/fail + output>
+- **Files modified:**  list
+- **Ruff:** pass/fail + any warnings
+- **verify.py:** pass/fail + output

@@ -25,11 +25,17 @@ class MetricProcessor:
     Handles z-score standardization, trend analysis, and rolling statistics.
     """
 
-    def __init__(self, config: VegetationConfig, spatial_manager: SpatialDataManager):
+    def __init__(self, config: VegetationConfig, spatial_manager: SpatialDataManager) -> None:
         self.config = config
         self.spatial_manager = spatial_manager
 
-    def metric_scores(self, df, sum_cols, standard_score_bins, soilmoist_bins):
+    def metric_scores(
+        self,
+        df: pd.DataFrame,
+        sum_cols: list[str],
+        standard_score_bins: list[float],
+        soilmoist_bins: list[float],
+    ) -> pd.DataFrame:
         """
         Converts metric columns to integer vulnerability scores based on provided bins.
         Returns only the score columns along with UID and date. Input DataFrame is untouched.
@@ -63,11 +69,11 @@ class MetricProcessor:
 
     def trend_slope(
         self,
-        df,
-        z_cols,
-        temporal_scale,
-        trend_window_width,
-    ):
+        df: pd.DataFrame,
+        z_cols: list[str],
+        temporal_scale: str,
+        trend_window_width: int,
+    ) -> pd.DataFrame:
         """
         Memory-efficient trend slope calculation.
         Returns only slope columns (does NOT modify input DataFrame).
@@ -127,7 +133,9 @@ class MetricProcessor:
 
         return result
 
-    def rolling_z(self, df, z_cols, temporal_scale, window_years):
+    def rolling_z(
+        self, df: pd.DataFrame, z_cols: list[str], temporal_scale: str, window_years: int
+    ) -> pd.DataFrame:
         """
         Memory-efficient rolling mean calculation.
         Returns only rolling mean columns (does NOT modify input DataFrame).
@@ -168,12 +176,12 @@ class MetricProcessor:
 
     def standardise_z(
         self,
-        df,
-        metrics,
-        input_is_percentile_rank=None,
-        exclude_years=None,
-        date_col="date",
-    ):
+        df: pd.DataFrame,
+        metrics: list[str],
+        input_is_percentile_rank: list[str] | str | None = None,
+        exclude_years: list[int] | None = None,
+        date_col: str = "date",
+    ) -> pd.DataFrame:
         """
         Compute z-scores and return ONLY the new z-score columns.
 
@@ -228,7 +236,9 @@ class MetricProcessor:
 
         return result
 
-    def monthly_to_mean_annual(self, wit_df, metrics, temporal_scale):
+    def monthly_to_mean_annual(
+        self, wit_df: pd.DataFrame, metrics: list[str], temporal_scale: str
+    ) -> pd.DataFrame:
         """
         Aggregates monthly data to annual means with water-year or calendar-year logic.
 
@@ -269,7 +279,9 @@ class MetricProcessor:
 
         return result
 
-    def _append_tsli_scores(self, df, tsli_col="tsli", group_field="grp"):
+    def _append_tsli_scores(
+        self, df: pd.DataFrame, tsli_col: str = "tsli", group_field: str = "grp"
+    ) -> pd.DataFrame:
         """
         Assigns TSLI (Time Since Last Inundation) scores based on vegetation-specific thresholds.
         Efficient iteration over vegetation groups (small number ~18) rather than rows.
@@ -305,7 +317,9 @@ class MetricProcessor:
 
         return df
 
-    def process_tsli_robust(self, temporal_scale, chunk_size=10000, use_cache=True):
+    def process_tsli_robust(
+        self, temporal_scale: str, chunk_size: int = 10000, use_cache: bool = True
+    ) -> pd.DataFrame:
         """
         Optimized version of original logic.
         Maintains historical accuracy: finds max(end_date) where start_date < cutoff.
@@ -329,10 +343,10 @@ class MetricProcessor:
         # Check for cached results
         cache_file = Path(f"tsli_{temporal_scale}.parquet")
         if use_cache and cache_file.exists():
-            logger.info(f"Loading cached TSLI data from {cache_file}")
+            logger.info("Loading cached TSLI data from %s", cache_file)
             return pd.read_parquet(cache_file)
 
-        logger.info(f"Processing TSLI for {temporal_scale} temporal scale...")
+        logger.info("Processing TSLI for %s temporal scale...", temporal_scale)
 
         # Only load inundation data if we need to process (cache miss)
         logger.info("Loading inundation data for TSLI processing...")
@@ -419,14 +433,19 @@ class MetricProcessor:
 
         # Cache results
         if use_cache:
-            logger.info(f"Caching TSLI results to {cache_file}")
+            logger.info("Caching TSLI results to %s", cache_file)
             result.to_parquet(cache_file, index=False)
 
         return result
 
     def sum_rolling_and_slope(
-        self, rolling_df, slope_df, z_cols, year_window_width, trend_window_width
-    ):
+        self,
+        rolling_df: pd.DataFrame,
+        slope_df: pd.DataFrame,
+        z_cols: list[str],
+        year_window_width: int,
+        trend_window_width: int,
+    ) -> pd.DataFrame:
         logger.info("Combining rolling means and slopes into summed metrics...")
         df = rolling_df.merge(slope_df, on=["UID", "date"])
 
@@ -447,11 +466,13 @@ class VulnerabilityAggregator:
     Handles area-weighted averaging and vulnerability score calculation.
     """
 
-    def __init__(self, config: VegetationConfig, spatial_manager: SpatialDataManager):
+    def __init__(self, config: VegetationConfig, spatial_manager: SpatialDataManager) -> None:
         self.config = config
         self.spatial_manager = spatial_manager
 
-    def _extract_scores(self, index_cols, fname, score_cols):
+    def _extract_scores(
+        self, index_cols: list[str], fname: str, score_cols: list[str]
+    ) -> pd.DataFrame:
         """
         Extracts scores from saved CSV files for analysis.
 
@@ -512,7 +533,9 @@ class VulnerabilityAggregator:
 
         return (data - d_min) / denom
 
-    def _aggregate(self, df, ag_name, anae_group=True, tag=""):
+    def _aggregate(
+        self, df: pd.DataFrame, ag_name: str, anae_group: bool = True, tag: str = ""
+    ) -> pd.DataFrame | None:
         """
         Memory-optimized area-weighted aggregation using vectorized operations.
         Avoids creating intermediate DataFrames for 13M+ row datasets.
@@ -572,7 +595,7 @@ class VulnerabilityAggregator:
 
         return numerator / denominator
 
-    def _join_dataframes(self, z_scores_df, tsli_df):
+    def _join_dataframes(self, z_scores_df: pd.DataFrame, tsli_df: pd.DataFrame) -> pd.DataFrame:
         """
         Joins z-scores and TSLI data with spatial information.
         Uses left join to prevent row inflation from mismatched dates.
@@ -597,7 +620,9 @@ class VulnerabilityAggregator:
             self.spatial_manager.anae_gdf.drop(columns="geometry"), on="UID", how="left"
         )
 
-    def _calc_vulnerability_and_save(self, df, ag_name, save_file_root: str):
+    def _calc_vulnerability_and_save(
+        self, df: pd.DataFrame, ag_name: str, save_file_root: str
+    ) -> pd.DataFrame:
         """
         Calculates final vulnerability scores and saves results.
         Uses sanitized file paths to prevent directory traversal attacks.
@@ -639,7 +664,7 @@ class VulnerabilityAggregator:
         fname = Path(f"vulnerability-{safe_root}-{safe_ag_name}")
         zip_file = fname.with_suffix(".zip")
 
-        logger.info(f"Saving vulnerability scores to {zip_file}")
+        logger.info("Saving vulnerability scores to %s", zip_file)
 
         # Save as compressed CSV
         compression_opts = {"method": "zip", "archive_name": fname.with_suffix(".csv").name}
@@ -647,7 +672,7 @@ class VulnerabilityAggregator:
 
         return vuln_df
 
-    def detect_temporal_scale_from_df(self, df):
+    def detect_temporal_scale_from_df(self, df: pd.DataFrame) -> str:
         """
         Infers temporal scale from date column patterns.
 
@@ -666,7 +691,9 @@ class VulnerabilityAggregator:
                 return "water-year"
         return "unknown_interval"
 
-    def aggregate_and_save_vulnerability(self, z_scores_df, tsli_df, save_file_root: str = None):
+    def aggregate_and_save_vulnerability(
+        self, z_scores_df: pd.DataFrame, tsli_df: pd.DataFrame, save_file_root: str | None = None
+    ) -> None:
         """
         Main aggregation pipeline: joins data, aggregates across scales, calculates vulnerability.
 
@@ -692,7 +719,7 @@ class VulnerabilityAggregator:
             # Save aggregated data
             fname = f"metric-scores-{save_file_root}-{ag_name}.csv"
             agg_df.to_csv(fname)
-            logger.debug(f"Saved aggregated {ag_name} data to {fname}")
+            logger.debug("Saved aggregated %s data to %s", ag_name, fname)
 
             # Calculate and save vulnerability scores
             self._calc_vulnerability_and_save(agg_df, ag_name, save_file_root)

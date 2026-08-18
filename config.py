@@ -7,7 +7,7 @@ using Pydantic models for validation and type safety.
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -32,7 +32,7 @@ class BaseConfig(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=False)
 
-    def __init__(self, **data):
+    def __init__(self, **data: Any) -> None:
         super().__init__(**data)
         # Set project root and resolve relative paths
         if self.project_root is None:
@@ -73,7 +73,7 @@ class NDVILandsatConfig(BaseConfig):
     # Output path (computed)
     output_path: Optional[Path] = Field(default=None)
 
-    def __init__(self, **data):
+    def __init__(self, **data: Any) -> None:
         super().__init__(**data)
         if self.output_path is None:
             self.output_path = self.data_path / "ndvi/landsat"
@@ -105,7 +105,7 @@ class SoilMoistureConfig(BaseConfig):
     output_path: Optional[Path] = Field(default=None)
     root_zone_soil_moisture_netcdf_path: Optional[Path] = Field(default=None)
 
-    def __init__(self, **data):
+    def __init__(self, **data: Any) -> None:
         super().__init__(**data)
         if self.output_path is None:
             self.output_path = self.data_path / "soil_moisture"
@@ -147,7 +147,7 @@ class WITMetricsConfig(BaseConfig):
     output_path: Optional[Path] = Field(default=None)
     shapefile_key: Optional[str] = Field(default=None)
 
-    def __init__(self, **data):
+    def __init__(self, **data: Any) -> None:
         super().__init__(**data)
         if self.output_path is None:
             self.output_path = self.data_path / "wit_metrics"
@@ -216,7 +216,7 @@ class VegetationConfig(BaseConfig):
     # ANAE groupings (computed during initialization)
     anae_groupings: Optional[Dict[str, str]] = Field(default=None)
 
-    def __init__(self, **data):
+    def __init__(self, **data: Any) -> None:
         super().__init__(**data)
 
         # Convert relative paths to absolute
@@ -293,7 +293,7 @@ def load_config(name: str, config_file: Optional[Path] = None) -> BaseConfig:
     config_class = CONFIG_MODELS[name]
     try:
         config = config_class(**yaml_data)
-        logger.info(f"Loaded {name} configuration from {config_file}")
+        logger.info("Loaded %s configuration from %s", name, config_file)
         return config
     except Exception as e:
         raise RuntimeError(f"Failed to validate {name} configuration: {e}") from e

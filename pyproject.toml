@@ -4,6 +4,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = [".tmp"]
 
 [tool.ruff.lint]
 select = [
@@ -13,6 +14,8 @@ select = [
     "W",   # warnings
     "C4",  # flake8-comprehensions
     "B",   # flake8-bugbear
+    "G",   # flake8-logging-format
+    "LOG", # flake8-logging
 ]
 
 exclude = [
@@ -31,8 +34,9 @@ ignore = [
     ### Intentionally disabled
     "E402",  # module level import not at top of file
     "E501",  # line too long
+    "G201", # logging .exception instead of .error
 ]
- 
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"

@@ -14,7 +14,7 @@ _client = None
 # =========================
 
 
-def start_dask(workers=None):
+def start_dask(workers: int | None = None) -> DaskClient:
     """Start a Dask local cluster with optimized settings."""
 
     total_memory_gb = psutil.virtual_memory().total / (1024**3)
@@ -56,17 +56,17 @@ def start_dask(workers=None):
 
     client = DaskClient(cluster)
 
-    logger.info(f"Dask cluster: {n_workers} workers")
-    logger.info(f"  x {threads_per_worker} threads per worker")
-    logger.info(f"  x {memory_limit_per_worker} GB worker memory limit")
-    logger.info(f"{50 * '='}")
-    logger.info(f"Dask Dashboard: {cluster.dashboard_link}")
-    logger.info(f"{50 * '='}")
+    logger.info("Dask cluster: %s workers", n_workers)
+    logger.info("  x %s threads per worker", threads_per_worker)
+    logger.info("  x %s GB worker memory limit", memory_limit_per_worker)
+    logger.info("%s", 50 * "=")
+    logger.info("Dask Dashboard: %s", cluster.dashboard_link)
+    logger.info("%s", 50 * "=")
 
     return client
 
 
-def get_dask_client():
+def get_dask_client() -> DaskClient:
     """Get or create Dask client for distributed computing."""
     global _client
     if _client is None or _client.status == "closed":

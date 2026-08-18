@@ -20,16 +20,17 @@ import multiprocessing
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import Iterable, Iterator, List, Optional, Tuple, Union
 
 import fiona
 import numpy as np
 import pandas as pd
+from fiona.model import Feature
 from shapely import geometry
 from tqdm import tqdm
 
 # Add project root to sys.path to allow imports from config.py and tools/
-# This handles cases where the script is moved to a subfolder (e.g., input_pipelines/)
+# This handles cases where the script is moved to a subfolder (e.g., data_pipelines/)
 current_path = Path(__file__).resolve().parent
 if (current_path / "config.py").exists():
     project_root = current_path
@@ -37,17 +38,20 @@ else:
     project_root = current_path.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
-from config import load_config
+from config import WITMetricsConfig, load_config
 from tools.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
+
+FeatureId = str | int
+MetricMember = str | list[str]
 
 # ------------------------------------------------------------------------------
 # validate inputs
 # ------------------------------------------------------------------------------
 
 
-def validate_config(config) -> None:
+def validate_config(config: WITMetricsConfig) -> None:
     """
     Validates configuration before processing starts.
     Catches issues early rather than failing hours into a batch job.
@@ -102,7 +106,7 @@ def validate_config(config) -> None:
     # Report results
     if warnings:
         for w in warnings:
-            logger.warning(f"Config warning: {w}")
+            logger.warning("Config warning: %s", w)
 
     if errors:
         error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
@@ -115,8 +119,8 @@ def validate_config(config) -> None:
 
 
 def shape_list(
-    key: str, values: Iterable, shapefile: Union[str, Path]
-) -> Iterator[Tuple[Any, Dict[str, Any]]]:
+    key: str, values: Iterable[FeatureId], shapefile: Union[str, Path]
+) -> Iterator[Tuple[FeatureId, Feature]]:
     """
     Yields features from a shapefile that match the given keys.
 
@@ -136,7 +140,7 @@ def shape_list(
                 yield k, feat
 
 
-def get_areas(polygons: Iterable[Tuple[Any, Dict[str, Any]]], pkey: str) -> Optional[pd.DataFrame]:
+def get_areas(polygons: Iterable[Tuple[FeatureId, Feature]], pkey: str) -> Optional[pd.DataFrame]:
     """
     Calculates the area of each feature in hectares.
 
@@ -163,7 +167,7 @@ def get_areas(polygons: Iterable[Tuple[Any, Dict[str, Any]]], pkey: str) -> Opti
 # ------------------------------------------------------------------------------
 
 
-def _add_combined_members(df: pd.DataFrame, members: List[Any]) -> pd.DataFrame:
+def _add_combined_members(df: pd.DataFrame, members: List[MetricMember]) -> pd.DataFrame:
     """
     Adds combined metric columns to the DataFrame (e.g., 'water+wet').
 
@@ -235,7 +239,7 @@ def _resample_metrics(df: pd.DataFrame, freq: str, pkey: str) -> pd.DataFrame:
 def annual_metrics(
     wit_data: pd.DataFrame,
     output_path: Path,
-    members: Optional[List[Any]] = None,
+    members: Optional[List[MetricMember]] = None,
     pkey: str = "feature_id",
 ) -> pd.DataFrame:
     """
@@ -285,7 +289,7 @@ def annual_metrics(
 def monthly_metrics(
     wit_data: pd.DataFrame,
     output_path: Path,
-    members: Optional[List[Any]] = None,
+    members: Optional[List[MetricMember]] = None,
     pkey: str = "feature_id",
 ) -> pd.DataFrame:
     """
@@ -727,7 +731,12 @@ def adaptive_inundation_threshold(
     total = len(threshold_df)
 
     logger.debug(
-        f"Chunk {chunk} has {total} features. Adaptive inundation threshold {threshold_percentile}  with Floor ({min_threshold}) and Ceiling ({max_threshold})."
+        "Chunk %s has %s features. Adaptive inundation threshold %s  with Floor (%s) and Ceiling (%s).",
+        chunk,
+        total,
+        threshold_percentile,
+        min_threshold,
+        max_threshold,
     )
 
     # 5. Save and Return
@@ -763,7 +772,7 @@ def merge_batches(
         out_files = list(path.glob(f"{fname}*.parquet"))
         if out_files:
             result_fname = f"{tag}{fname}.csv"
-            logger.info(f"Merging {len(out_files)} batch outputs into {result_fname} ...")
+            logger.info("Merging %s batch outputs into %s ...", len(out_files), result_fname)
             dfs = []
             for out_file in tqdm(out_files, ncols=160):
                 try:
@@ -773,7 +782,7 @@ def merge_batches(
                         missing_cols = set(monthly_subset) - set(df.columns)
                         if missing_cols:
                             logger.warning(
-                                f"Monthly subset columns missing from {out_file}: {missing_cols}"
+                                "Monthly subset columns missing from %s: %s", out_file, missing_cols
                             )
                             available_subset = [c for c in monthly_subset if c in df.columns]
                             dfs.append(df[available_subset])
@@ -782,7 +791,7 @@ def merge_batches(
                     else:
                         dfs.append(df)
                 except Exception as ex:
-                    logger.error(f"Error reading file: {out_file} - {ex}")
+                    logger.error("Error reading file: %s - %s", out_file, ex)
                     raise
             if dfs:
                 out_data = pd.concat(dfs)
@@ -793,7 +802,7 @@ def merge_batches(
                     try:
                         out_data = out_data.merge(labels_df, on=Labels_join_field)
                     except Exception as ex:
-                        logger.error(f"Error merging labels: {ex}")
+                        logger.error("Error merging labels: %s", ex)
                         raise
 
                 compression = None
@@ -805,7 +814,7 @@ def merge_batches(
                         path / result_fname, index=False, compression=compression
                     )
                 except Exception as ex:
-                    logger.error(f"Error writing merged file: {result_fname} - {ex}")
+                    logger.error("Error writing merged file: %s - %s", result_fname, ex)
                     raise
 
 
@@ -826,12 +835,12 @@ def delete_old_batch_outputs(path: Path, output_filenames: List[str]) -> None:
                 out_file.unlink()
                 deleted_count += 1
             except Exception as ex:
-                logger.error(f"Error deleting file: {out_file} - {ex}")
+                logger.error("Error deleting file: %s - %s", out_file, ex)
                 error_count += 1
     if error_count > 0:
-        logger.warning(f"Failed to delete {error_count} batch outputs")
+        logger.warning("Failed to delete %s batch outputs", error_count)
     if deleted_count > 0:
-        logger.debug(f"Deleted {deleted_count} batch outputs")
+        logger.debug("Deleted %s batch outputs", deleted_count)
 
 
 # ------------------------------------------------------------------------------
@@ -839,7 +848,9 @@ def delete_old_batch_outputs(path: Path, output_filenames: List[str]) -> None:
 # ------------------------------------------------------------------------------
 
 
-def load_batch(csv_files: List[Path], chunk_id: int, config) -> Optional[pd.DataFrame]:
+def load_batch(
+    csv_files: List[Path], chunk_id: int, config: WITMetricsConfig
+) -> Optional[pd.DataFrame]:
     """
     Loads, cleans, and combines a batch of CSV files.
 
@@ -863,10 +874,10 @@ def load_batch(csv_files: List[Path], chunk_id: int, config) -> Optional[pd.Data
         try:
             df = pd.read_csv(f)
         except pd.errors.EmptyDataError:
-            logger.warning(f"Skipping empty CSV file: {f}")
+            logger.warning("Skipping empty CSV file: %s", f)
             continue
         except Exception as e:
-            logger.error(f"Error reading {f}: {e}")
+            logger.error("Error reading %s: %s", f, e)
             raise
 
         if df.empty:
@@ -886,7 +897,7 @@ def load_batch(csv_files: List[Path], chunk_id: int, config) -> Optional[pd.Data
         dfs.append(df)
 
     if not dfs:
-        logger.warning(f"Chunk {chunk_id}: No valid data after loading {len(csv_files)} files")
+        logger.warning("Chunk %s: No valid data after loading %s files", chunk_id, len(csv_files))
         return None
 
     # 3. Combine all files
@@ -923,10 +934,10 @@ def write_batch_parquet(batch_df: pd.DataFrame, batch_fname: Path) -> Path:
         # Atomic rename
         tmp_out.replace(batch_fname)
 
-        logger.info(f"  Written batch output:  {batch_fname}")
+        logger.info("  Written batch output:  %s", batch_fname)
 
     except Exception as e:
-        logger.error(f"  Failed to write {batch_fname}: {e}")
+        logger.error("  Failed to write %s: %s", batch_fname, e)
         tmp_out.unlink(missing_ok=True)
         raise IOError(f"Parquet write failed for {batch_fname}") from e
 
@@ -938,7 +949,7 @@ def write_batch_parquet(batch_df: pd.DataFrame, batch_fname: Path) -> Path:
 # ------------------------------------------------------------------------------
 
 
-def process_batch(csv_files: List[Path], chunk_id: int, config) -> None:
+def process_batch(csv_files: List[Path], chunk_id: int, config: WITMetricsConfig) -> None:
     """
     Orchestrates the processing of a single batch of files.
 
@@ -1042,9 +1053,9 @@ def main() -> None:
     batch_size = config.batch_size
     chunk_size = batch_size * CPU
 
-    logger.info(f"Processing with {CPU} worker processes")
-    logger.info(f"Found {total_csv_files} WIT CSV files")
-    logger.info(f"Batch size per process: {batch_size}")
+    logger.info("Processing with %s worker processes", CPU)
+    logger.info("Found %s WIT CSV files", total_csv_files)
+    logger.info("Batch size per process: %s", batch_size)
 
     start = time.process_time()
 
@@ -1064,8 +1075,9 @@ def main() -> None:
             pool.starmap(process_batch, work)
 
     logger.info(
-        f"{total_csv_files} CSVs processed in "
-        f"{time.strftime('%H:%M:%S', time.gmtime(time.process_time() - start))}"
+        "%s CSVs processed in %s",
+        total_csv_files,
+        time.strftime("%H:%M:%S", time.gmtime(time.process_time() - start)),
     )
 
     # ------------------------------------------------------------------
